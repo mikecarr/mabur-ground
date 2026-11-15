@@ -802,6 +802,15 @@ int run_scan(const LiveOpts& o, const maburgs::Config& cfg) {
     return 1;
   }
   const maburgs::CardCaps caps = fe->caps();
+  if (maburgs::scan_plan(caps).empty()) {
+    // An unrecognised card reports no 5 GHz tune range: nothing to scan.
+    report_error("card reports no 5 GHz range");
+    std::printf("SCAN error card reports no 5 GHz range\n");
+    std::fflush(stdout);
+    fe->stop();
+    q.close();
+    return 1;
+  }
   const auto baseline = load_scan_baseline(o.scan_baseline);
   const auto source = maburgs::scan_source(maburgs::probe_nhm_busy(*fe), !baseline.empty());
   maburgs::ScanRunCfg rc;
@@ -820,6 +829,7 @@ int run_scan(const LiveOpts& o, const maburgs::Config& cfg) {
       *fe, rc, [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); },
       [] { return static_cast<int64_t>(now_us() / 1000); });
   run.set_alive([&] { return fe->alive(); });
+  run.set_should_stop([] { return g_stop.load(std::memory_order_acquire); });
   std::vector<maburgs::ScanDwellOut> dwells;
   std::vector<mabur::node::RxBody> sink;
   maburgs::ScanDwellOut d;
@@ -836,7 +846,7 @@ int run_scan(const LiveOpts& o, const maburgs::Config& cfg) {
     std::printf("%s\n", webgs::scan_result_line(res, opts, rates).c_str());
     std::fflush(stdout);
   };
-  while (!g_stop.load(std::memory_order_acquire) && run.step(d)) {
+  while (run.step(d)) {
     dwells.push_back(d);
     std::printf("%s\n", webgs::scan_dwell_line(d).c_str());
     std::fflush(stdout);

@@ -4,7 +4,6 @@
 // (retune, settle, discard read, NHM arm, observe, NHM + energy read), so a
 // scan's busy % means what the auto pick's does. It never transmits: no
 // search, no DISC, no beacon window.
-#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -52,11 +51,11 @@ class ScanRunner {
  public:
   ScanRunner(ScoutRadio& radio, ScanRunCfg cfg, std::function<void(int)> sleep_ms,
              std::function<int64_t()> now_ms);
-  // One dwell; false once all rounds are done, stop() was called, or the
+  // One dwell; false once all rounds are done, should_stop() says so, or the
   // card is gone (lost()). A retune on an unplugged card can still report
   // success, so liveness is asked before every dwell.
   bool step(ScanDwellOut& out);
-  void stop() { stop_.store(true, std::memory_order_release); }
+  void set_should_stop(std::function<bool()> should_stop) { should_stop_ = std::move(should_stop); }
   void set_alive(std::function<bool()> alive) { alive_ = std::move(alive); }
   bool lost() const { return lost_; }
   int round() const { return round_; }
@@ -68,7 +67,7 @@ class ScanRunner {
   std::function<void(int)> sleep_;
   std::function<int64_t()> now_;
   std::function<bool()> alive_;
-  std::atomic<bool> stop_{false};
+  std::function<bool()> should_stop_;
   bool lost_ = false;
   int round_ = 0;
   size_t idx_ = 0;
