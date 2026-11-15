@@ -451,6 +451,57 @@ spotter's group shows the channel and its follow state instead (see
 "Spotter follower"). The core's `maburgs channel: …` / `maburgs hop: …`
 stderr lines appear verbatim in the browser console log.
 
+### Channel scan
+
+**Scan channels** on the disconnected screen (USB card only) runs a
+pre-flight survey instead of a link: the core starts as `live --mode scan
+--rounds 3 [--baseline /baseline.json]` (`run_scan`, `web/src/web_main.cpp`),
+opens the card at 20 MHz and steps `maburgs::ScanRunner`
+(`gs/src/scan_runner.h`) over every 20 MHz channel inside the card's
+`tune5g` range (36-64, 100-144, 149-177). Each dwell is the scout's observe
+path (retune, `settle_ms`, discard read, NHM arm, `dwell_ms`, NHM + energy
+read) with the bundle's `[radio.scan]` knobs. Nothing is transmitted: no
+DISC, no beacon window, no video pipeline. A scan ends by itself after its
+rounds (a clean exit returns the session to idle) or on Stop.
+
+The core reports `SCAN <kind> <json>` lines on stdout (`web/src/scan_json.h`;
+parsed by `web/ui/src/lib/scan.js`):
+
+| line | fields |
+|---|---|
+| `SCAN caps` | `chip`, `gen`, `source` (`nhm` / `estimate` / `rank`), `plan`, `rounds`, `blocked_pct` |
+| `SCAN dwell` | `ch`, `round`, `reading`, `busy` (% or null), `rate` (FA+CCA per s), `own`, `foreign`, `floor` (dBm or null) |
+| `SCAN result` | `chans`, `pairs`, `advice`, `advice_no_dfs`, `rates` — after every round, and once more if stopped mid-round |
+| `SCAN done` / `SCAN error <text>` | end of scan / the card did not open |
+
+**Busy, per card.** A card with NHM (8812EU/8812CU) reports busy % exactly
+as the scout does (`nhm_busy_pct` at `busy_dbm`), so "clean" means below
+`blocked_pct`, the same threshold as the auto pick. A counter-only card
+(8812AU/8821AU) has no busy %: without a baseline its channels are only
+ranked by FA+CCA rate (`rank`, no clean/busy verdicts). **Save as quiet
+baseline** stores the scan's per-channel rates in `localStorage`
+(`webgs.scanBaseline.<chip>`); later scans with that chip pass them as
+`/baseline.json` and report `estimate`:
+`clamp(100 * (rate - base[ch]) / (20 * base_max), 0, 100)`.
+
+**Pairs and the recommendation** (`gs/src/scan_advice.h`).
+Each standard 40 MHz pair is judged on its worse half: `ok40` (both clean),
+`only20` (one clean half, named), `busy`, or `rank` (a half unread, or a
+rank-only scan). Pairs on the drone's 8822E spur centres (52+56, 100+104,
+116+120, 149+153, 157+161) are tagged "slow retune" and lose ties on busy.
+The recommendation is 40 MHz when at least 4 usable pairs are `ok40` (named
+by their upper channel, so the set shares one `ht40_offset`), else the 4
+least-busy 20 MHz channels; only link-grid channels (36-64, 100-144, 149-165) are
+proposed, and a channel with no reading never is. Fewer than 4 usable or
+clean channels is shown flagged. **Include DFS** switches between `advice`
+and `advice_no_dfs` without a rescan.
+
+**Use this** shows the drone's `[radio]` lines and asks for confirmation,
+then writes the set and width into the page config with the link on Auto.
+The drone's `/etc/mabur.toml` must get the same set by hand
+(`docs/channel-select.md` "Config"). **Copy GS link** gives
+`?chs=…&w=…&ch=auto`.
+
 ### Spotter follower
 
 A spotter has no control link, so it cannot be told where the link is;

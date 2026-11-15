@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -33,6 +35,9 @@
 #include "web_phase.h"
 #ifdef WEBGS_LIVE
 #include "body_queue.h"
+#include "json.hpp"
+#include "scan_json.h"
+#include "scan_runner.h"
 #include "link_card.h"
 #include "radio_frontend.h"
 #include "relay_ring_transport.h"
@@ -437,6 +442,9 @@ struct LiveOpts {
   int secs = 0;              // 0 = until the card goes away
   std::string bad_chw;       // non-numeric --ch/--w, reported by run_live
   std::string relay;         // --relay host:port: mabur-relay v4 over UDP instead of USB
+  bool scan = false;         // --mode scan: the pre-flight channel scan, no link
+  int scan_rounds = 3;       // --rounds N (1..20)
+  std::string scan_baseline; // --baseline <file>: quiet counter rates (scan_json.h)
 };
 
 // Strict decimal int: the whole string, no sign games, fits an int.
@@ -758,9 +766,108 @@ const std::vector<maburgs::RadioFrontend::UsbId> kCards = {
     {0x2357, 0x011e}, {0x2357, 0x0120}, {0x2357, 0x0122},
 };
 
+// Quiet-baseline counter rates per channel ({"36": rate, ...}), written by
+// the page from an earlier scan. Missing or malformed = no baseline.
+std::map<uint8_t, double> load_scan_baseline(const std::string& path) {
+  std::map<uint8_t, double> out;
+  if (path.empty()) return out;
+  std::ifstream f(path);
+  if (!f) return out;
+  const auto j = nlohmann::json::parse(f, nullptr, false);
+  if (!j.is_object()) return out;
+  for (const auto& [k, v] : j.items()) {
+    int ch = 0;
+    if (!parse_int(k.c_str(), ch) || ch < 1 || ch > 177 || !v.is_number()) continue;
+    out[static_cast<uint8_t>(ch)] = v.get<double>();
+  }
+  return out;
+}
+
+// Pre-flight scan: one card at 20 MHz, measure-only dwells over the whole
+// band, results as `SCAN ...` lines (scan_json.h). Never transmits.
+int run_scan(const LiveOpts& o, const maburgs::Config& cfg) {
+  maburgs::BodyQueue q;
+  maburgs::RadioFrontend::Cfg fc;
+  fc.ids = kCards;
+  fc.channel = 36;
+  fc.width_mhz = 20;
+  fc.card_id = 0;
+  fc.usb_late_gauge = true;
+  auto fe = std::make_unique<maburgs::RadioFrontend>(fc, q);
+  if (!fe->open_and_start()) {
+    const std::string& e = fe->open_error();
+    report_error("%s", e == "no device" ? "no RTL card" : e.c_str());
+    std::printf("SCAN error %s\n", e.c_str());
+    std::fflush(stdout);
+    return 1;
+  }
+  const maburgs::CardCaps caps = fe->caps();
+  const auto baseline = load_scan_baseline(o.scan_baseline);
+  const auto source = maburgs::scan_source(maburgs::probe_nhm_busy(*fe), !baseline.empty());
+  maburgs::ScanRunCfg rc;
+  rc.plan = maburgs::scan_plan(caps);
+  rc.dwell_ms = cfg.radio.scan.dwell_ms;
+  rc.settle_ms = cfg.radio.scan.settle_ms;
+  rc.rounds = o.scan_rounds;
+  rc.busy_dbm = cfg.radio.scan.busy.busy_dbm;
+  mabur::scan::Opts opts;
+  opts.blocked_pct = cfg.radio.scan.busy.blocked_pct;
+  opts.source = source;
+  std::printf("%s\n", webgs::scan_caps_line(caps, source, rc.plan, rc.rounds, opts.blocked_pct).c_str());
+  std::fflush(stdout);
+
+  maburgs::ScanRunner run(
+      *fe, rc, [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); },
+      [] { return static_cast<int64_t>(now_us() / 1000); });
+  run.set_alive([&] { return fe->alive(); });
+  std::vector<maburgs::ScanDwellOut> dwells;
+  std::vector<mabur::node::RxBody> sink;
+  maburgs::ScanDwellOut d;
+  int last_round = 0;
+  size_t emitted = 0;   // dwells covered by the last result line
+  auto emit_result = [&] {
+    emitted = dwells.size();
+    std::map<uint8_t, double> rates;   // mean counter rate per channel: the next baseline
+    std::map<uint8_t, int> n;
+    for (const auto& x : dwells)
+      if (x.reading) { rates[x.ch] += x.rate_per_s; ++n[x.ch]; }
+    for (auto& [ch, r] : rates) r /= n[ch];
+    const auto res = maburgs::summarize(dwells, source, baseline.empty() ? nullptr : &baseline);
+    std::printf("%s\n", webgs::scan_result_line(res, opts, rates).c_str());
+    std::fflush(stdout);
+  };
+  while (!g_stop.load(std::memory_order_acquire) && run.step(d)) {
+    dwells.push_back(d);
+    std::printf("%s\n", webgs::scan_dwell_line(d).c_str());
+    std::fflush(stdout);
+    q.drain(sink, 0);   // received frames are not used; keep the queue empty
+    sink.clear();
+    if (run.round() != last_round) {
+      last_round = run.round();
+      emit_result();
+    }
+  }
+  // The dwell that ran while the card went away read nothing real.
+  if (run.lost() && !dwells.empty()) dwells.pop_back();
+  if (dwells.size() != emitted) emit_result();   // stopped or lost mid-round: the partial result
+  fe->stop();
+  q.close();
+  if (run.lost()) {
+    // The page keeps the result lines above and shows the error.
+    report_error("card lost");
+    std::printf("SCAN error card lost\nDONE\n");
+    std::fflush(stdout);
+    return 1;
+  }
+  std::printf("SCAN done\nDONE\n");
+  std::fflush(stdout);
+  return 0;
+}
+
 int run_live(const LiveOpts& o) {
   maburgs::Config cfg;
   if (!load_cfg(o.config, o.overlay, cfg)) return 2;
+  if (o.scan) return run_scan(o, cfg);
   std::fprintf(stderr, "webgs: link key %s (%s)\n",
                mabur::key_fingerprint(cfg.link.key).c_str(), cfg.link.key_source.c_str());
   if (!o.bad_chw.empty()) {
@@ -871,7 +978,8 @@ int usage(FILE* out, int rc) {
                "                    [--control-trace <file>] [--fake-ack] [--record <file.mp4>]\n"
 #ifdef WEBGS_LIVE
                "       webgs live [-c config.toml] [--overlay file.toml] [--ch N] [--w 20|40]\n"
-               "                  [--secs 0] [--mode gs|spotter] [--relay host:port]\n"
+               "                  [--secs 0] [--mode gs|spotter|scan] [--relay host:port]\n"
+               "                  scan: [--rounds 3] [--baseline rates.json]\n"
                "                  (ch/w default to the pin or the first member / the derived width)\n"
 #endif
                "default config: %s\n",
@@ -899,8 +1007,14 @@ int parse_live(int argc, char** argv, int first, LiveOpts& o) {
         o.bad_chw = std::string("width '") + v + "' is not 20 or 40";
     }
     else if (k == "--secs") o.secs = std::atoi(v);
+    else if (k == "--mode" && std::string(v) == "scan") o.scan = true;
     else if (k == "--mode") { if (!parse_mode(v, o.mode)) return usage(stderr, 2); }
     else if (k == "--relay") o.relay = v;
+    else if (k == "--rounds") {
+      if (!parse_int(v, o.scan_rounds) || o.scan_rounds < 1 || o.scan_rounds > 20)
+        return usage(stderr, 2);
+    }
+    else if (k == "--baseline") o.scan_baseline = v;
     else return usage(stderr, 2);
   }
   return -1;

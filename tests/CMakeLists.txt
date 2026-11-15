@@ -84,6 +84,8 @@ set_tests_properties(test_dvr_mux PROPERTIES
 
 add_mtest(test_gs_config test_gs_config.cpp LIBS mabur_gs_core)
 add_mtest(test_card_scan test_card_scan.cpp LIBS mabur_gs_core)
+add_mtest(test_scan_advice test_scan_advice.cpp LIBS mabur_gs_core)
+add_mtest(test_scan_runner test_scan_runner.cpp LIBS mabur_gs_core)
 add_mtest(test_gap_timeout_policy test_gap_timeout_policy.cpp LIBS mabur_gs_core)
 add_mtest(test_pts_anchor test_pts_anchor.cpp LIBS mabur_gs_core)
 add_mtest(test_lat_window test_lat_window.cpp LIBS mabur_gs_core)
@@ -295,6 +297,7 @@ target_compile_definitions(test_web_gs PRIVATE MABUR_SOURCE_DIR="${PROJECT_SOURC
 add_mtest(test_spotter_follow test_spotter_follow.cpp LIBS mabur_web_core)
 # WebPhase (web/src/web_phase.h): PhaseLock + RateMatch wrapper for the page.
 add_mtest(test_web_phase test_web_phase.cpp LIBS mabur_web_core)
+add_mtest(test_scan_json test_scan_json.cpp LIBS mabur_web_core)
 add_mtest(test_relay_ring test_relay_ring.cpp LIBS mabur_web_core)
 add_test(NAME web_relay_e2e
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/web/tests/test_relay_e2e.py $<TARGET_FILE:webgs>)

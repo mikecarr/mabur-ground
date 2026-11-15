@@ -1,7 +1,7 @@
 <script>
   import Icon from './Icon.svelte';
   import bg from '../assets/fpv-feed.jpg';
-  let { mode, onMode, onConnect, error = null, notice = null, blocker = null, busy = false, stopping = false,
+  let { mode, onMode, onConnect, onScan = null, error = null, notice = null, blocker = null, busy = false, stopping = false,
         padRight = false, mobile = false, radio = 'usb', onRadio = () => {}, relayAddr = '', onRelayAddr = () => {},
         showAddr = false } = $props();
   const HINT = {
@@ -34,6 +34,11 @@
   <button class="btn btn-primary" type="button" onclick={onConnect} disabled={busy || !!blocker}
     style="margin-top:4px;{mobile ? 'min-height:44px' : ''}">
     <Icon name="plugs-connected" />{mode === 'spotter' ? 'Connect as spotter' : 'Connect'}</button>
+  {#if onScan}
+    <button class="btn btn-secondary" type="button" onclick={onScan} disabled={busy || radio === 'relay'}
+      title={radio === 'relay' ? 'Scan needs a USB card' : 'Measure every 5 GHz channel before a flight (no transmit)'}
+      style={mobile ? 'min-height:44px' : ''}><Icon name="broadcast" />Scan channels</button>
+  {/if}
 </div>
 <style>
   .ov { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;

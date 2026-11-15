@@ -550,3 +550,45 @@ test('relay connect waits for prepareRelay(addr); its rejection is the error + c
   assert.equal(s2.snapshot.errorCode, 'relay-not-found');   // App reveals the field on this
   assert.match(s2.snapshot.error, /No CPE relay found/);
 });
+
+test('scan connect passes scan args, baseline file and routes SCAN lines', async () => {
+  const scans = [];
+  const t = fakeTimers();
+  const f = fakeModuleFactory();
+  const s = new Session({
+    createModule: f.create, requestDevice: async () => {}, onAu: () => {}, onStats: () => {},
+    onScan: (kind, data) => scans.push([kind, data]), reload: () => {}, timers: t,
+  });
+  await s.connect({ mode: 'scan', scanRounds: 3, baselineJson: '{"36":9}' });
+  const m = f.made[0];
+  assert.deepEqual(m.opts.arguments, ['live', '--mode', 'scan', '--rounds', '3', '--baseline', '/baseline.json']);
+  assert.equal(m.files['/baseline.json'], '{"36":9}');
+  m.opts.print('SCAN dwell {"ch":36,"round":0}');
+  m.opts.print('CHANNEL 40');
+  assert.deepEqual(scans, [['dwell', { ch: 36, round: 0 }]]);
+});
+
+test('scan connect without a baseline passes no --baseline', async () => {
+  const { s, f } = mk();
+  await s.connect({ mode: 'scan', scanRounds: 3 });
+  assert.deepEqual(f.made[0].opts.arguments, ['live', '--mode', 'scan', '--rounds', '3']);
+});
+
+test('scan session exit keeps partial results and returns to idle', async () => {
+  const scans = [];
+  const t = fakeTimers();
+  const f = fakeModuleFactory();
+  const s = new Session({
+    createModule: f.create, requestDevice: async () => {}, onAu: () => {}, onStats: () => {},
+    onScan: (kind, data) => scans.push(kind), reload: () => {}, timers: t,
+  });
+  const states = [];
+  s.subscribe((v) => states.push(v.state));
+  await s.connect({ mode: 'scan', scanRounds: 3 });
+  const m = f.made[0];
+  m.opts.print('SCAN dwell {"ch":36,"round":0}');
+  m.opts.print('SCAN dwell {"ch":40,"round":0}');
+  m.opts.onExit(0);
+  assert.equal(states.at(-1), 'idle');
+  assert.deepEqual(scans, ['dwell', 'dwell']);
+});

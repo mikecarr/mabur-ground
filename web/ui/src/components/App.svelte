@@ -9,6 +9,7 @@
   import FloatStats from './FloatStats.svelte';
   import ConfigSide from './ConfigSide.svelte';
   import VtxPanel from './VtxPanel.svelte';
+  import ScanPanel from './ScanPanel.svelte';
   import { ui, saveMode, reloadToConfig, relaySavedAtLoad } from '../lib/ui.svelte.js';
   import { Session, WORKER_FAILED, isWindowWorkerFailure } from '../lib/session.js';
   import { VideoPipeline } from '../lib/video.js';
@@ -26,6 +27,7 @@
   import { OsdLayer, OsdPainter } from '../lib/osd.js';
   import { loadFontList, fontFile } from '../lib/osdfonts.js';
   import { ScreenWake } from '../lib/wakelock.js';
+  import { ScanState, loadBaseline, saveBaseline, applyAdvice, showScanPanel, scanMessage } from '../lib/scan.js';
 
   let canvas = $state(null);
   let glCanvas = $state(null);
@@ -34,6 +36,8 @@
   let sess = $state({ state: 'idle', mode: ui.mode, ch: null, w: null, error: null, notice: null, startedAt: null, recWish: false });
   let sessionCfg = $state(ui.cfg);        // the config the running session started with
   let copyMsg = $state('');
+  // Pre-flight channel scan: null = panel closed; else ScanState.view.
+  let scanView = $state(null), scanState = null;
   let hiddenBanner = $state(false), hiddenShown = false;
   const recClock = new RecClock();
   const wake = new ScreenWake();
@@ -135,6 +139,12 @@
     // table is replaced on every push, so the panel's "accepted" fade
     // needs its own arrival stamp rather than trusting age_ms alone.
     onParams: (p) => { ui.params = p; ui.paramsAt = Date.now(); },
+    onScan: (kind, data) => {
+      if (!scanState) return;
+      scanState.apply(kind, data);
+      scanView = scanState.view;
+      if (kind === 'caps') { try { localStorage.setItem('webgs.scanChip', data.chip); } catch { /* optional */ } }
+    },
     reload: reloadToConfig,
   });
 
@@ -219,6 +229,7 @@
 
   async function connect() {
     if (blocker) return;
+    closeScan();   // a link takes the screen; the panel never sits over video
     saveMode(ui.mode, ui.radio, ui.relayAddr);
     saveConfig(localStorageSafe(), $state.snapshot(ui.cfg));
     sessionCfg = structuredClone($state.snapshot(ui.cfg));
@@ -240,6 +251,31 @@
     checkUsbGranted();
   }
   function localStorageSafe() { try { return localStorage; } catch { return null; } }
+  // Scan: USB only, no overlay (the scan knobs are the bundle defaults).
+  // The quiet baseline is per chip; the chip is only known once a scan has
+  // reported its caps, so a scan uses the last scanned chip's baseline.
+  async function startScan() {
+    const st = session.snapshot.state;
+    if (st !== 'idle' && st !== 'error') return;
+    let chip = scanView?.caps?.chip ?? null;
+    if (!chip) { try { chip = localStorage.getItem('webgs.scanChip'); } catch { chip = null; } }
+    const base = chip ? loadBaseline(localStorageSafe(), chip) : null;
+    scanState = new ScanState();
+    scanView = scanState.view;
+    await session.connect({ mode: 'scan', scanRounds: 3, baselineJson: base ? JSON.stringify(base) : null });
+    refresh();
+  }
+  function stopScan() { return session.disconnect(); }
+  function closeScan() { scanState = null; scanView = null; }
+  function useScanAdvice(advice) {
+    onCfgChange(applyAdvice($state.snapshot(ui.cfg), advice, ui.mode), `Channels from scan: ${advice.width} MHz ${advice.set.join(',')}`);
+  }
+  function saveScanBaseline() {
+    const chip = scanView?.caps?.chip, rates = scanView?.result?.rates;
+    if (!chip || !rates) return;
+    saveBaseline(localStorageSafe(), chip, rates);
+    ui.applied = `Quiet baseline saved for ${chip} · ${new Date().toTimeString().slice(0, 8)}`;
+  }
   async function onLoadKey(file) {
     try {
       const hex = parseKeyText(await file.text());
@@ -411,9 +447,14 @@
           <canvas class="vgl" bind:this={glCanvas} width="1280" height="720" style="visibility:hidden"></canvas>
           <!-- MSP OSD: page-lifetime like the video canvas; .videoinner IS the visible area in every layout. -->
           <canvas class="osd" bind:this={osdCanvas}></canvas>
-          {#if live && status}<div class="status glass">{status}</div>{/if}
-          {#if !live}
-            <DisconnectedOverlay mode={ui.mode} onMode={(m) => (ui.mode = m)} onConnect={connect}
+          {#if live && status && sess.mode !== 'scan'}<div class="status glass">{status}</div>{/if}
+          {#if showScanPanel(scanView, sess)}
+            <ScanPanel view={scanView} running={sess.mode === 'scan' && (live || busy)} setChannels={ui.cfg.channels}
+              message={scanMessage(scanView, sess)}
+              mobile={layout !== 'windowed' && LW < 1000} onRescan={startScan} onStop={stopScan} onClose={closeScan}
+              onUse={useScanAdvice} onSaveBaseline={saveScanBaseline} />
+          {:else if !live}
+            <DisconnectedOverlay mode={ui.mode} onMode={(m) => (ui.mode = m)} onConnect={connect} onScan={startScan}
               error={sess.state === 'error' ? sess.error : null} notice={sess.notice} {blocker} {busy} stopping={sess.state === 'stopping'}
               padRight={layout === 'immersive' && ui.cfgOpen} mobile={layout !== 'windowed' && LW < 1000}
               radio={ui.radio} onRadio={(r) => (ui.radio = r)} relayAddr={ui.relayAddr} onRelayAddr={(a) => (ui.relayAddr = a)}
