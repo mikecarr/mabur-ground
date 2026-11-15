@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include "mtest.h"
@@ -17,6 +18,7 @@ struct FakeRadio : ScoutRadio {
   int busy_pct_on[256];             // NHM busy % per channel; -1: no NHM window
   uint32_t cca_per_ms_on[256] = {};
   bool retune_ok_on[256];
+  int throw_retune_on = -1, throw_read_on = -1;   // a USB control transfer that fails
   uint64_t foreign_per_dwell_on[256] = {};
   uint16_t armed = 0;
   ScoutFrames fr;
@@ -27,6 +29,7 @@ struct FakeRadio : ScoutRadio {
   }
   bool retune(uint8_t c) override {
     calls.push_back("retune " + std::to_string(c));
+    if (c == throw_retune_on) throw std::runtime_error("rtw_write failed");
     if (!retune_ok_on[c]) return false;
     ch = c;
     return true;
@@ -47,6 +50,7 @@ struct FakeRadio : ScoutRadio {
   }
   ScoutEnergy read_energy(bool with_nhm) override {
     calls.push_back(with_nhm ? "read+nhm" : "read");
+    if (with_nhm && ch == throw_read_on) throw std::runtime_error("rtw_read(0f48)");
     ScoutEnergy e;
     e.fa_valid = true;
     e.cca_ofdm = static_cast<uint32_t>((now - last_read) * cca_per_ms_on[ch]);
@@ -182,6 +186,22 @@ TEST(card_lost_ends_scan_and_says_so) {
   CHECK(!r.run->step(d));
   CHECK(r.run->lost());
   CHECK(r.radio.calls.size() == n);   // no dwell against a gone card
+}
+
+// devourer throws when a USB register access fails; on WebUSB that happens
+// under heavy RX. One failed dwell is "no reading", never the end of the scan.
+TEST(a_throwing_radio_call_is_one_unread_dwell) {
+  Rig r({36, 40, 44});
+  r.radio.throw_retune_on = 40;
+  r.radio.throw_read_on = 44;
+  std::vector<ScanDwellOut> v;
+  bool threw = false;
+  try { v = r.all(); } catch (...) { threw = true; }
+  CHECK(!threw);
+  CHECK(v.size() == 3);
+  CHECK(v[0].reading);
+  CHECK(v[1].ch == 40 && !v[1].reading && !v[1].busy_valid);
+  CHECK(v[2].ch == 44 && !v[2].reading);
 }
 
 TEST(source_from_busy_window) {

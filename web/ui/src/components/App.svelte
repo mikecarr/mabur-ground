@@ -11,7 +11,7 @@
   import VtxPanel from './VtxPanel.svelte';
   import ScanPanel from './ScanPanel.svelte';
   import { ui, saveMode, reloadToConfig, relaySavedAtLoad } from '../lib/ui.svelte.js';
-  import { Session, WORKER_FAILED, isWindowWorkerFailure } from '../lib/session.js';
+  import { Session, workerFailedText, isWindowWorkerFailure } from '../lib/session.js';
   import { VideoPipeline } from '../lib/video.js';
   import { Telemetry } from '../lib/telemetry.js';
   import { statsView, debugGroups, statusText, linkTag } from '../lib/view.js';
@@ -422,7 +422,7 @@
       else { hiddenBanner = false; wake.onVisible(); }
     };
     document.addEventListener('visibilitychange', onVis);
-    const onWinErr = (e) => { if (isWindowWorkerFailure(e)) session.fail(WORKER_FAILED); };
+    const onWinErr = (e) => { if (isWindowWorkerFailure(e)) session.fail(workerFailedText(e && e.message)); };
     window.addEventListener('error', onWinErr);
     return () => { clearInterval(iv); ro.disconnect(); clearTimeout(copyTimer); document.removeEventListener('fullscreenchange', onFsChange);
       document.removeEventListener('visibilitychange', onVis); window.removeEventListener('error', onWinErr); wake.set(false); };

@@ -1,6 +1,7 @@
 #include "scan_runner.h"
 
 #include <algorithm>
+#include <exception>
 #include <optional>
 
 #include "nhm_busy.h"
@@ -46,7 +47,23 @@ bool ScanRunner::step(ScanDwellOut& out) {
     idx_ = 0;
     ++round_;
   }
-  if (!radio_.retune(out.ch)) return true;
+  // devourer throws when a USB register access fails, which WebUSB does under
+  // heavy RX. One failed dwell reads as "no reading"; a card that is really
+  // gone shows up through alive() before the next dwell.
+  try {
+    dwell_(out);
+  } catch (const std::exception&) {
+    const uint8_t ch = out.ch;
+    const int round = out.round;
+    out = ScanDwellOut{};
+    out.ch = ch;
+    out.round = round;
+  }
+  return true;
+}
+
+void ScanRunner::dwell_(ScanDwellOut& out) {
+  if (!radio_.retune(out.ch)) return;
   sleep_(cfg_.settle_ms);
   // Discard barrier: the counters are delta-on-read, so this zeroes what
   // accumulated on the previous channel before the observe opens.
@@ -70,7 +87,6 @@ bool ScanRunner::step(ScanDwellOut& out) {
   out.foreign = static_cast<uint32_t>(f1.foreign - f0.foreign);
   out.floor_valid = e.floor_valid;
   out.floor_dbm = e.floor_dbm;
-  return true;
 }
 
 std::vector<mabur::scan::ChanResult> summarize(const std::vector<ScanDwellOut>& dwells,

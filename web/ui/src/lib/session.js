@@ -20,6 +20,17 @@ import { parseScanLine } from './scan.js';
 export const WORKER_FAILED = 'Page worker failed — if served over LAN, the TLS CA is not trusted on '
   + 'this device (see docs/web-gs.md).';
 
+// The page text for a worker failure. A worker that never loaded reports no
+// detail at all ("undefined:undefined: undefined" -- the untrusted LAN cert
+// case WORKER_FAILED names); a worker that loaded and then crashed carries the
+// uncaught error after the script location, which is the useful part.
+export function workerFailedText(line) {
+  const t = String(line || '');
+  const m = t.match(/:\d+: (Uncaught .*)$/) || t.match(/^(Uncaught .*)$/);
+  if (!m || t.includes('undefined:undefined: undefined')) return WORKER_FAILED;
+  return `Page worker crashed (${m[1]}) — details in the browser console. Press Connect to restart.`;
+}
+
 export class Session {
   constructor({ createModule, requestDevice, onAu, onStats, onOsd = () => {}, onRecClosed = () => {},
                 onChannel = () => {}, onParams = () => {}, onScan = () => {}, reload,
@@ -119,7 +130,7 @@ export class Session {
         },
         printErr: (t) => {
           console.error('[webgs]', t);
-          if (this.token === token && isWorkerFailure(String(t))) this.fail(WORKER_FAILED);
+          if (this.token === token && isWorkerFailure(String(t))) this.fail(workerFailedText(t));
         },
       });
     } catch (e) {

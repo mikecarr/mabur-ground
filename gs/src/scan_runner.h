@@ -62,6 +62,7 @@ class ScanRunner {
   int round() const { return round_; }
 
  private:
+  void dwell_(ScanDwellOut& out);   // the radio steps of one dwell; may throw
   ScoutRadio& radio_;
   ScanRunCfg cfg_;
   std::function<void(int)> sleep_;

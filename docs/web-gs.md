@@ -360,8 +360,12 @@ What the status overlay shows (`statusText()`, `web/ui/src/lib/view.js`):
 
   Connect re-enables, so trying again costs nothing.
 - `Page worker failed — if served over LAN, the TLS CA is not trusted on
-  this device (see docs/web-gs.md).` — the untrusted-cert failure mode
-  (see Serve, above).
+  this device (see docs/web-gs.md).` — a worker that never loaded, the
+  untrusted-cert failure mode (see Serve, above).
+- `Page worker crashed (<uncaught error>) — details in the browser
+  console. Press Connect to restart.` — a worker that loaded and then died
+  on an uncaught exception (`workerFailedText()` in `session.js` tells the
+  two apart by whether the error carries a script location).
 
 This page's ladder starts from whatever `web/CMakeLists.txt` embeds into the
 WASM module at build time. That is the bundle default,

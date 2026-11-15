@@ -79,6 +79,8 @@ class RadioFrontend : public LinkCard {
   uint64_t tx_frames() const override;  // control frames handed to the radio OK
   uint64_t tx_fail() const override;    // send_control calls that returned false
   uint64_t foreign() const override;   // CRC-clean frames dropped by the SA filter
+  // read_energy*() samples lost to a failed register read (see read_energy).
+  uint64_t energy_read_fails() const { return energy_read_fail_.load(std::memory_order_relaxed); }
   bool send_control(const std::vector<uint8_t>& body) override;  // false pre-ready/on error
   bool can_scout() const override { return true; }
 
@@ -138,6 +140,8 @@ class RadioFrontend : public LinkCard {
   std::atomic<bool> alive_{false};
   std::atomic<uint64_t> rx_frames_{0};
   std::atomic<uint64_t> foreign_{0};
+  // read_energy()/read_energy_scout() samples lost to a failed register read.
+  std::atomic<uint64_t> energy_read_fail_{0};
   std::atomic<uint64_t> tx_frames_{0};
   std::atomic<uint64_t> tx_fail_{0};
   uint16_t tx_seq_ = 0;
