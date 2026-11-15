@@ -115,7 +115,16 @@ export function scanRows(view, setChannels = []) {
 
 const PAIR_TEXT = { ok40: '40 MHz OK', busy: 'busy', rank: 'no verdict' };
 
+// A rank-only scan (counter card, no baseline) has no busy %, so no pair can
+// be judged: one line says why instead of a column of "no verdict".
+export function pairsHint(view) {
+  return view?.caps?.source === 'rank'
+    ? 'Verdicts need a quiet baseline: this card has no busy %. Scan somewhere quiet with the drone off, then Save as quiet baseline.'
+    : null;
+}
+
 export function pairRows(view) {
+  if (pairsHint(view)) return [];
   const est = view?.caps?.source === 'estimate';
   return (view?.result?.pairs ?? []).map((p) => {
     let text = p.verdict === 'only20' ? `20 MHz on ${p.clean} only` : PAIR_TEXT[p.verdict] ?? 'no verdict';
@@ -129,6 +138,35 @@ export function adviceFor(view, includeDfs) {
   const r = view?.result;
   if (!r) return null;
   return (includeDfs ? r.advice : r.advice_no_dfs) ?? null;
+}
+
+// The session as the link UI should see it: a scan is not a link, so the
+// header tag, Record and the sidebar treat it as idle. Errors stay visible.
+export function asLinkState(sess) {
+  if (sess.mode !== 'scan' || sess.state === 'error') return sess;
+  return { ...sess, state: 'idle' };
+}
+
+// Where a scan is: starting (the card is opening or closing; Stop can't act
+// yet), running, or idle.
+export function scanPhase(sess) {
+  if (sess.mode !== 'scan') return 'idle';
+  if (sess.state === 'live') return 'running';
+  if (sess.state === 'connecting' || sess.state === 'stopping') return 'starting';
+  return 'idle';
+}
+
+// A baseline must cover every channel: one saved from a stopped scan would
+// leave the unreached channels reading near 0 % later. NHM cards need none.
+export function canSaveBaseline(view) {
+  const c = view?.caps;
+  if (!c || c.source === 'nhm' || !view.done || view.error || !view.result?.rates) return false;
+  return view.dwells >= (c.plan?.length ?? 0) * (c.rounds ?? 0);
+}
+
+export function adviceNote(advice) {
+  if (!advice.flagged || /usable channels/.test(advice.reason)) return advice.reason;
+  return `${advice.reason} — some of these channels are busy`;
 }
 
 export function confirmText(advice) {

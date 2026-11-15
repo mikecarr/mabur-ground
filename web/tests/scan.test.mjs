@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   parseScanLine, ScanState, loadBaseline, saveBaseline, gsFragment, droneLines, applyAdvice,
   scanRows, pairRows, confirmText, adviceFor, showScanPanel, scanMessage, canUseAdvice,
+  asLinkState, scanPhase, pairsHint, canSaveBaseline, adviceNote,
 } from '../ui/src/lib/scan.js';
 import { defaultConfig, pageWidth } from '../ui/src/lib/config.js';
 
@@ -160,4 +161,48 @@ test('scan panel shows session errors and notices', () => {
   assert.equal(scanMessage({ error: null }, { state: 'error', error: 'Card busy — close that' }), 'Card busy — close that');
   assert.equal(scanMessage({ error: null }, { state: 'idle', notice: 'No device selected' }), 'No device selected');
   assert.equal(scanMessage({ error: null }, { state: 'live', error: 'stale' }), null);
+});
+
+test('a scan session looks idle to the link UI', () => {
+  const scan = { state: 'live', mode: 'scan', error: null };
+  assert.equal(asLinkState(scan).state, 'idle');
+  assert.equal(asLinkState({ state: 'connecting', mode: 'scan' }).state, 'idle');
+  const gs = { state: 'live', mode: 'gs' };
+  assert.equal(asLinkState(gs), gs);
+  assert.equal(asLinkState({ state: 'error', mode: 'scan', error: 'x' }).state, 'error');
+});
+
+test('scanPhase: starting while connecting, running only when live', () => {
+  assert.equal(scanPhase({ mode: 'scan', state: 'connecting' }), 'starting');
+  assert.equal(scanPhase({ mode: 'scan', state: 'live' }), 'running');
+  assert.equal(scanPhase({ mode: 'scan', state: 'stopping' }), 'starting');
+  assert.equal(scanPhase({ mode: 'scan', state: 'idle' }), 'idle');
+  assert.equal(scanPhase({ mode: 'gs', state: 'live' }), 'idle');
+});
+
+test('rank-only scans explain the missing verdicts once instead of per pair', () => {
+  const pairs = [{ lo: 36, hi: 40, verdict: 'rank', clean: 0, spur: false }];
+  const rank = { caps: { source: 'rank' }, result: { pairs } };
+  assert.match(pairsHint(rank), /quiet baseline/);
+  assert.deepEqual(pairRows(rank), []);
+  const nhm = { caps: { source: 'nhm' }, result: { pairs: [{ ...pairs[0], verdict: 'ok40' }] } };
+  assert.equal(pairsHint(nhm), null);
+  assert.equal(pairRows(nhm).length, 1);
+});
+
+test('a baseline is saved only from a complete counter scan', () => {
+  const caps = { source: 'rank', plan: [36, 40], rounds: 3 };
+  const result = { rates: { 36: 1, 40: 2 } };
+  assert.equal(canSaveBaseline({ caps, result, dwells: 6, done: true }), true);
+  assert.equal(canSaveBaseline({ caps, result, dwells: 4, done: true }), false);    // stopped early
+  assert.equal(canSaveBaseline({ caps, result, dwells: 6, done: false }), false);   // still running
+  assert.equal(canSaveBaseline({ caps: { ...caps, source: 'nhm' }, result, dwells: 6, done: true }), false);
+  assert.equal(canSaveBaseline({ caps, result, dwells: 6, done: true, error: 'card lost' }), false);
+});
+
+test('adviceNote says why a recommendation is flagged', () => {
+  assert.equal(adviceNote({ flagged: false, reason: '12 clean pairs → 40 MHz has room' }), '12 clean pairs → 40 MHz has room');
+  assert.equal(adviceNote({ flagged: true, reason: 'only 3 usable channels' }), 'only 3 usable channels');
+  assert.equal(adviceNote({ flagged: true, reason: 'only 1 clean pairs → 20 MHz' }),
+    'only 1 clean pairs → 20 MHz — some of these channels are busy');
 });

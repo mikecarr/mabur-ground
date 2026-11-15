@@ -1,7 +1,8 @@
 <script>
   import Icon from './Icon.svelte';
-  import { scanRows, pairRows, adviceFor, gsFragment, droneLines, confirmText, canUseAdvice } from '../lib/scan.js';
-  let { view, running = false, setChannels = [], mobile = false, message = null,
+  import { scanRows, pairRows, pairsHint, adviceFor, adviceNote, canSaveBaseline, gsFragment, droneLines, confirmText,
+    canUseAdvice } from '../lib/scan.js';
+  let { view, phase = 'idle', setChannels = [], mobile = false, message = null,
         onRescan = () => {}, onStop = () => {}, onClose = () => {}, onUse = () => {}, onSaveBaseline = () => {} } = $props();
 
   let includeDfs = $state(true);
@@ -19,6 +20,8 @@
   const source = $derived(view?.caps?.source ?? 'nhm');
   const total = $derived((view?.caps?.plan?.length ?? 0) * (view?.caps?.rounds ?? 0));
   const counterCard = $derived(source !== 'nhm');
+  const running = $derived(phase !== 'idle');
+  const hint = $derived(pairsHint(view));
 
   async function copy(text, what) {
     try { await navigator.clipboard.writeText(text); copied = what; } catch { copied = 'copy failed'; }
@@ -29,10 +32,12 @@
 <div class="scan" class:mobile>
   <div class="head">
     <span class="title"><Icon name="broadcast" />Channel scan</span>
-    {#if view?.caps}<span class="dim5">{view.caps.chip} · {running ? `dwell ${view.dwells}/${total}` : view.done ? 'done' : 'stopped'}</span>{/if}
+    {#if view?.caps}<span class="dim5">{view.caps.chip} · {phase === 'running' ? `dwell ${view.dwells}/${total}` : phase === 'starting' ? 'starting…' : view.done ? 'done' : 'stopped'}</span>{/if}
     <span class="grow"></span>
-    {#if running}
+    {#if phase === 'running'}
       <button class="btn btn-ghost" type="button" onclick={onStop}>Stop</button>
+    {:else if phase === 'starting'}
+      <span class="dim5">Starting…</span>
     {:else}
       <button class="btn btn-secondary" type="button" onclick={onRescan}>Rescan</button>
       <button class="btn btn-ghost" type="button" onclick={onClose}>Close</button>
@@ -55,6 +60,9 @@
     {/each}
   </div>
 
+  {#if hint}
+    <span class="dim5 note">{hint}</span>
+  {/if}
   {#if pairs.length}
     <div class="pairs">
       <span class="sub">40 MHz pairs</span>
@@ -69,13 +77,13 @@
     <div class="advice">
       <span class="sub">Recommendation{counterCard ? ' (estimate)' : ''}</span>
       <span class="big">{advice.width} MHz · {advice.set.join(', ')}</span>
-      <span class="dim5">{advice.reason}{advice.flagged ? ' — not all of these are clean' : ''}</span>
+      <span class="dim5">{adviceNote(advice)}</span>
       <label class="dim5"><input type="checkbox" bind:checked={includeDfs} /> Include DFS channels</label>
       <div class="btns">
         <button class="btn btn-ghost" type="button" onclick={() => copy(gsFragment(advice), 'GS link copied')}>Copy GS link</button>
         <button class="btn btn-ghost" type="button" onclick={() => copy(droneLines(advice), 'drone lines copied')}>Copy drone lines</button>
         {#if !running}<button class="btn btn-primary" type="button" onclick={() => (confirm = true)}>Use this</button>{/if}
-        {#if !running && counterCard}<button class="btn btn-ghost" type="button" onclick={onSaveBaseline}
+        {#if !running && canSaveBaseline(view)}<button class="btn btn-ghost" type="button" onclick={onSaveBaseline}
           title="Scan somewhere quiet first: later scans with this card are estimated against it">Save as quiet baseline</button>{/if}
       </div>
       {#if copied}<span class="dim5">{copied}</span>{/if}

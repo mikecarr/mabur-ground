@@ -466,7 +466,10 @@ opens the card at 20 MHz and steps `maburgs::ScanRunner`
 path (retune, `settle_ms`, discard read, NHM arm, `dwell_ms`, NHM + energy
 read) with the bundle's `[radio.scan]` knobs. Nothing is transmitted: no
 DISC, no beacon window, no video pipeline. A scan ends by itself after its
-rounds (a clean exit returns the session to idle) or on Stop.
+rounds (a clean exit returns the session to idle) or on Stop. A card that
+reports no 5 GHz tune range ends it at once with `SCAN error`. While a scan
+runs it is not a link: Record stays off, and the header tag, sidebar and
+config panel do not react to it.
 
 The core reports `SCAN <kind> <json>` lines on stdout (`web/src/scan_json.h`;
 parsed by `web/ui/src/lib/scan.js`):
@@ -482,8 +485,10 @@ parsed by `web/ui/src/lib/scan.js`):
 as the scout does (`nhm_busy_pct` at `busy_dbm`), so "clean" means below
 `blocked_pct`, the same threshold as the auto pick. A counter-only card
 (8812AU/8821AU) has no busy %: without a baseline its channels are only
-ranked by FA+CCA rate (`rank`, no clean/busy verdicts). **Save as quiet
-baseline** stores the scan's per-channel rates in `localStorage`
+ranked by FA+CCA rate (`rank`, no clean/busy verdicts; the panel says so in
+one line instead of listing pairs). **Save as quiet baseline**, offered only
+after a scan that completed every dwell (a stopped scan would leave its
+unreached channels reading near 0 % later), stores the scan's per-channel rates in `localStorage`
 (`webgs.scanBaseline.<chip>`); later scans with that chip pass them as
 `/baseline.json` and report `estimate`:
 `clamp(100 * (rate - base[ch]) / (20 * base_max), 0, 100)`.

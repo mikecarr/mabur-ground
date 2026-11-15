@@ -109,6 +109,10 @@ TEST(plan_full_band) {
   CHECK(std::find(p.begin(), p.end(), 149) != p.end());
 }
 
+TEST(plan_empty_without_tune_range) {
+  CHECK(scan_plan(caps(0, 0)).empty());
+}
+
 TEST(plan_respects_tune_range) {
   const auto p = scan_plan(caps(5170, 5330));
   CHECK((p == std::vector<uint8_t>{36, 40, 44, 48, 52, 56, 60, 64}));
@@ -167,9 +171,11 @@ TEST(rate_is_counters_per_second) {
 
 TEST(scan_stops_cleanly_mid_round) {
   Rig r({36, 40, 44});
+  bool stop = false;
+  r.run->set_should_stop([&] { return stop; });
   ScanDwellOut d;
   CHECK(r.run->step(d));
-  r.run->stop();
+  stop = true;
   const size_t n = r.radio.calls.size();
   CHECK(!r.run->step(d));
   CHECK(r.radio.calls.size() == n);   // no further retune once stopped

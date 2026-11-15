@@ -34,8 +34,8 @@ ScanRunner::ScanRunner(ScoutRadio& radio, ScanRunCfg cfg, std::function<void(int
     : radio_(radio), cfg_(std::move(cfg)), sleep_(std::move(sleep_ms)), now_(std::move(now_ms)) {}
 
 bool ScanRunner::step(ScanDwellOut& out) {
-  if (stop_.load(std::memory_order_acquire) || lost_ || cfg_.plan.empty() || round_ >= cfg_.rounds)
-    return false;
+  if (lost_ || cfg_.plan.empty() || round_ >= cfg_.rounds) return false;
+  if (should_stop_ && should_stop_()) return false;
   if (alive_ && !alive_()) {
     lost_ = true;
     return false;

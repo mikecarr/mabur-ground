@@ -189,7 +189,7 @@ export class Session {
     }
     const st = this.snapshot.state;
     // A scan ends on its own when its rounds are done: a clean exit, not a fault.
-    if (this.snapshot.mode === 'scan' && code === 0) {
+    if (this.snapshot.mode === 'scan' && code === 0 && st !== 'error') {
       this.set({ state: 'idle' });
       return;
     }

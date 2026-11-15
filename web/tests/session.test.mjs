@@ -601,3 +601,15 @@ test('workerFailedText: a load failure keeps the TLS hint, a crash names its err
   assert.equal(workerFailedText('Uncaught RuntimeError: unreachable'),
     'Page worker crashed (Uncaught RuntimeError: unreachable) — details in the browser console. Press Connect to restart.');
 });
+
+test('a scan exit after a failure keeps the error', async () => {
+  const t = fakeTimers();
+  const f = fakeModuleFactory({ exitOnStop: false });
+  const s = new Session({ createModule: f.create, requestDevice: async () => {}, onAu: () => {}, onStats: () => {},
+    reload: () => {}, timers: t });
+  await s.connect({ mode: 'scan', scanRounds: 3 });
+  s.fail('Page worker crashed (x)');
+  f.made[0].opts.onExit(0);
+  assert.equal(s.snapshot.state, 'error');
+  assert.match(s.snapshot.error, /crashed/);
+});

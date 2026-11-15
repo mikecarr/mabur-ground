@@ -27,7 +27,8 @@
   import { OsdLayer, OsdPainter } from '../lib/osd.js';
   import { loadFontList, fontFile } from '../lib/osdfonts.js';
   import { ScreenWake } from '../lib/wakelock.js';
-  import { ScanState, loadBaseline, saveBaseline, applyAdvice, showScanPanel, scanMessage } from '../lib/scan.js';
+  import { ScanState, loadBaseline, saveBaseline, applyAdvice, showScanPanel, scanMessage, asLinkState,
+    scanPhase } from '../lib/scan.js';
 
   let canvas = $state(null);
   let glCanvas = $state(null);
@@ -164,11 +165,13 @@
     // outlive its session on the VTX tab.
     if (s.state !== 'live' && s.state !== 'connecting') { video.close(); clearOsd(); ui.params = null; ui.paramsAt = null; }
     wake.set(s.state === 'live' || s.state === 'connecting');
-    if (s.state === 'live' && prevState !== 'live') { ui.tab = 'stats'; ui.sideTab = 'vtx'; ui.cfgOpen = false; ui.statsVisible = true; }
-    if (prevState === 'stopping' && s.state === 'idle') { ui.tab = 'config'; ui.sideTab = 'config'; ui.cfgOpen = true; }
-    if (s.state === 'error' && prevState === 'live') { ui.tab = 'config'; ui.sideTab = 'config'; }
+    // A scan is not a link: the sidebar and config panel stay where they are.
+    const ls = asLinkState(s).state;
+    if (ls === 'live' && prevState !== 'live') { ui.tab = 'stats'; ui.sideTab = 'vtx'; ui.cfgOpen = false; ui.statsVisible = true; }
+    if (prevState === 'stopping' && ls === 'idle') { ui.tab = 'config'; ui.sideTab = 'config'; ui.cfgOpen = true; }
+    if (ls === 'error' && prevState === 'live') { ui.tab = 'config'; ui.sideTab = 'config'; }
     if (s.state === 'error' && s.errorCode === 'relay-not-found') ui.relayFieldOpen = true;
-    prevState = s.state;
+    prevState = ls;
   });
 
   // Upright phone: the UI is drawn rotated (layout.js uiFrame). LW x LH is
@@ -219,7 +222,7 @@
       hitches60: tele.hitches60(nowMs), hitchesTotal: video.hitchesTotal, seg: tele.seg || { w1: {}, w60: {} }, lrec,
       phase: live && sess.mode === 'gs' ? video.phase.snapshot() : null });
     spark = live ? sparkPoints(tele.spark) : '0,24 100,24';
-    tag = linkTag({ state: sess.state, mode: sess.mode, core });
+    tag = linkTag({ state: asLinkState(sess).state, mode: sess.mode, core });
     recClock.update(rec.state, nowMs);
     recMs = recClock.elapsedMs(nowMs);
     status = statusText({ state: sess.state, mode: sess.mode, ch: sess.ch, w: sess.w, core,
@@ -306,8 +309,10 @@
   const recCovers = $derived(targetCovers(recTarget));
   const recOn = $derived(rec.state === 'recording');
   const recWaiting = $derived(rec.state === 'waiting');
-  const vtxReady = $derived(live && sess.mode === 'gs' && !!core?.session && !!core?.peer_acked);
-  const localReady = $derived(live && opfsOk && core?.lrec_avail !== 0);
+  // Recording needs a link: never during a scan.
+  const linkLive = $derived(asLinkState(sess).state === 'live');
+  const vtxReady = $derived(linkLive && sess.mode === 'gs' && !!core?.session && !!core?.peer_acked);
+  const localReady = $derived(linkLive && opfsOk && core?.lrec_avail !== 0);
   // Local needs only a live module with OPFS; VTX-only keeps today's rule.
   // Both falls back to the VTX-only rule when there's no browser storage --
   // Record still works then, just VTX-only.
@@ -449,7 +454,7 @@
           <canvas class="osd" bind:this={osdCanvas}></canvas>
           {#if live && status && sess.mode !== 'scan'}<div class="status glass">{status}</div>{/if}
           {#if showScanPanel(scanView, sess)}
-            <ScanPanel view={scanView} running={sess.mode === 'scan' && (live || busy)} setChannels={ui.cfg.channels}
+            <ScanPanel view={scanView} phase={scanPhase(sess)} setChannels={ui.cfg.channels}
               message={scanMessage(scanView, sess)}
               mobile={layout !== 'windowed' && LW < 1000} onRescan={startScan} onStop={stopScan} onClose={closeScan}
               onUse={useScanAdvice} onSaveBaseline={saveScanBaseline} />
