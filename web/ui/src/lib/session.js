@@ -15,18 +15,30 @@
 // exception: once disconnect() has driven the session cleanly back to
 // 'idle', a late onError must not flip it back into 'error'.
 import { errorText } from './logic.mjs';
+import { parseScanLine } from './scan.js';
 
 export const WORKER_FAILED = 'Page worker failed — if served over LAN, the TLS CA is not trusted on '
   + 'this device (see docs/web-gs.md).';
 
+// The page text for a worker failure. A worker that never loaded reports no
+// detail at all ("undefined:undefined: undefined" -- the untrusted LAN cert
+// case WORKER_FAILED names); a worker that loaded and then crashed carries the
+// uncaught error after the script location, which is the useful part.
+export function workerFailedText(line) {
+  const t = String(line || '');
+  const m = t.match(/:\d+: (Uncaught .*)$/) || t.match(/^(Uncaught .*)$/);
+  if (!m || t.includes('undefined:undefined: undefined')) return WORKER_FAILED;
+  return `Page worker crashed (${m[1]}) — details in the browser console. Press Connect to restart.`;
+}
+
 export class Session {
   constructor({ createModule, requestDevice, onAu, onStats, onOsd = () => {}, onRecClosed = () => {},
-                onChannel = () => {}, onParams = () => {}, reload,
+                onChannel = () => {}, onParams = () => {}, onScan = () => {}, reload,
                 // Wrapped: a bare window.setTimeout called as timers.setTimeout(...) throws "Illegal invocation".
                 timers = { setTimeout: (f, ms) => setTimeout(f, ms), clearTimeout: (h) => clearTimeout(h) },
                 stopTimeoutMs = 3000, recOffTimeoutMs = 1000,
                 checkIsolated = () => {}, startRelay = null, prepareRelay = async () => {} }) {
-    Object.assign(this, { createModule, requestDevice, onAu, onStats, onOsd, onRecClosed, onChannel, onParams, reload, timers,
+    Object.assign(this, { createModule, requestDevice, onAu, onStats, onOsd, onRecClosed, onChannel, onParams, onScan, reload, timers,
       stopTimeoutMs, recOffTimeoutMs, checkIsolated, startRelay, prepareRelay });
     this.subs = new Set();
     this.mod = null;
@@ -43,7 +55,7 @@ export class Session {
   subscribe(fn) { this.subs.add(fn); fn(this.snapshot); return () => this.subs.delete(fn); }
   set(patch) { this.snapshot = { ...this.snapshot, ...patch }; for (const f of this.subs) f(this.snapshot); }
 
-  async connect({ mode, ch, w, overlayToml, relay = null }) {
+  async connect({ mode, ch, w, overlayToml, relay = null, scanRounds = 3, baselineJson = null }) {
     const st = this.snapshot.state;
     if (st !== 'idle' && st !== 'error') return;
     this.lastCore = null;
@@ -67,16 +79,24 @@ export class Session {
     }
     // A page-worker failure (fail()) landed while a chooser/prompt was up.
     if (this.token !== token || this.snapshot.state !== 'connecting') return;
-    const args = ['live', '--mode', mode, '--ch', String(ch), '--w', String(w)];
-    // Both modes: the overlay's [radio] carries the channel set --ch is checked against.
+    // Scan: the pre-flight channel scan (lib/scan.js), no link and no TX.
+    const scan = mode === 'scan';
+    const args = scan ? ['live', '--mode', 'scan', '--rounds', String(scanRounds)]
+                      : ['live', '--mode', mode, '--ch', String(ch), '--w', String(w)];
+    // Both link modes: the overlay's [radio] carries the channel set --ch is checked against.
     const overlay = overlayToml || null;
     if (overlay) args.push('--overlay', '/overlay.toml');
-    if (relay) args.push('--relay', relay);
+    const baseline = scan && baselineJson ? baselineJson : null;
+    if (baseline) args.push('--baseline', '/baseline.json');
+    if (relay && !scan) args.push('--relay', relay);
+    const preRun = [];
+    if (overlay) preRun.push((m) => m.FS.writeFile('/overlay.toml', overlay));
+    if (baseline) preRun.push((m) => m.FS.writeFile('/baseline.json', baseline));
     let mod = null;
     try {
       mod = await this.createModule({
         arguments: args,
-        preRun: overlay ? [(m) => m.FS.writeFile('/overlay.toml', overlay)] : [],
+        preRun,
         onAu: (...a) => { if (this.token === token) this.onAu(...a); },
         onStats: (text) => { if (this.token === token) this.handleStats(text); },
         onOsd: (rows, cols, cells) => { if (this.token === token) this.onOsd(rows, cols, cells); },
@@ -102,12 +122,15 @@ export class Session {
         // line is dropped on token.exited.
         print: (t) => {
           console.log('[webgs]', t);
+          if (this.token !== token || token.exited) return;
           const m = /^CHANNEL (\d+)$/.exec(String(t));
-          if (m && this.token === token && !token.exited) this.onChannel(Number(m[1]));
+          if (m) { this.onChannel(Number(m[1])); return; }
+          const sl = scan ? parseScanLine(t) : null;
+          if (sl) this.onScan(sl.kind, sl.data);
         },
         printErr: (t) => {
           console.error('[webgs]', t);
-          if (this.token === token && isWorkerFailure(String(t))) this.fail(WORKER_FAILED);
+          if (this.token === token && isWorkerFailure(String(t))) this.fail(workerFailedText(t));
         },
       });
     } catch (e) {
@@ -165,6 +188,11 @@ export class Session {
       return;
     }
     const st = this.snapshot.state;
+    // A scan ends on its own when its rounds are done: a clean exit, not a fault.
+    if (this.snapshot.mode === 'scan' && code === 0) {
+      this.set({ state: 'idle' });
+      return;
+    }
     if (st === 'live' || st === 'connecting' || st === 'stopping') {
       // Unexpected exit. If onError already ran first, keep its mapped
       // text; otherwise fall back to a generic message that a following

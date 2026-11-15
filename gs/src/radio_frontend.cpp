@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <memory>
 
 #include "AdapterCaps.h"
@@ -326,7 +327,18 @@ bool RadioFrontend::set_width(uint8_t ch, uint8_t width_mhz) {
 ScoutEnergy RadioFrontend::read_energy(bool with_nhm) {
   ScoutEnergy out;
   if (!ready_.load(std::memory_order_acquire) || !device_) return out;
-  const RxEnergy e = device_->GetRxEnergy(with_nhm);
+  // A sensor sample is several USB control reads, and devourer throws when
+  // one fails (on WebUSB a control transfer can time out under bulk load).
+  // A lost sample is "no reading" -- out stays all-invalid -- not a reason
+  // to unwind the caller's thread; a card that is really gone shows as
+  // alive() == false through the RX loop instead.
+  RxEnergy e;
+  try {
+    e = device_->GetRxEnergy(with_nhm);
+  } catch (const std::exception&) {
+    energy_read_fail_.fetch_add(1, std::memory_order_relaxed);
+    return out;
+  }
   out.fa_valid = e.valid_fa;
   out.cca_ofdm = e.cca_ofdm;
   out.fa_ofdm = e.fa_ofdm;
@@ -341,7 +353,18 @@ ScoutEnergy RadioFrontend::read_energy(bool with_nhm) {
 ScoutEnergy RadioFrontend::read_energy_scout() {
   ScoutEnergy out;
   if (!ready_.load(std::memory_order_acquire) || !device_) return out;
-  const RxEnergy e = device_->GetRxEnergyScout();
+  // A sensor sample is several USB control reads, and devourer throws when
+  // one fails (on WebUSB a control transfer can time out under bulk load).
+  // A lost sample is "no reading" -- out stays all-invalid -- not a reason
+  // to unwind the caller's thread; a card that is really gone shows as
+  // alive() == false through the RX loop instead.
+  RxEnergy e;
+  try {
+    e = device_->GetRxEnergyScout();
+  } catch (const std::exception&) {
+    energy_read_fail_.fetch_add(1, std::memory_order_relaxed);
+    return out;
+  }
   out.fa_valid = e.valid_fa;
   out.cca_ofdm = e.cca_ofdm;
   out.fa_ofdm = e.fa_ofdm;
