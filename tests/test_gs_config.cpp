@@ -340,6 +340,31 @@ TEST(link_nack_section_parses_and_defaults_off) {
   CHECK(wide.link.nack.lookback == 600);
 }
 
+TEST(link_nack_residual_parses_three_values_and_refuses_others) {
+  auto dflt = maburgs::load_config(write_tmp(""));
+  CHECK(dflt.link.nack_residual == maburgs::NackResidual::kFilled);
+  auto f = maburgs::load_config(write_tmp("[link]\nnack_residual = \"filled\"\n"));
+  CHECK(f.link.nack_residual == maburgs::NackResidual::kFilled);
+  auto a = maburgs::load_config(write_tmp("[link]\nnack_residual = \"all\"\n"));
+  CHECK(a.link.nack_residual == maburgs::NackResidual::kAll);
+  auto t = maburgs::load_config(write_tmp("[link]\nnack_residual = \"timely\"\n"));
+  CHECK(t.link.nack_residual == maburgs::NackResidual::kTimely);
+  const std::string bad = what_of([] {
+    maburgs::load_config(write_tmp("[link]\nnack_residual = \"late\"\n"));
+  });
+  CHECK(bad.find("link.nack_residual") != std::string::npos);
+  CHECK(bad.find("must be") != std::string::npos);
+  const std::string num = what_of([] {
+    maburgs::load_config(write_tmp("[link]\nnack_residual = 1\n"));
+  });
+  CHECK(num.find("link.nack_residual") != std::string::npos);
+  // A [link] key, not a [link.nack] one.
+  const std::string nested = what_of([] {
+    maburgs::load_config(write_tmp("[link.nack]\nresidual = \"all\"\n"));
+  });
+  CHECK(!nested.empty());
+}
+
 TEST(nack_disabled_sends_nothing) {
   // Config off => the exporter never sees a block and the tracker is never
   // constructed enabled; pinned here at the config/exporter seam, and in
@@ -1084,15 +1109,20 @@ TEST(ladder_threshold_keys_parse_with_defaults) {
   CHECK(cfg.link.ladder_cfg.probation_ms == 3000);
   CHECK(cfg.link.ladder_cfg.penalty_base_ms == 10000);
   CHECK(cfg.link.ladder_cfg.penalty_max_ms == 60000);
+  CHECK(cfg.link.ladder_cfg.lockout_ms == 0);
+  CHECK(cfg.link.ladder_cfg.lockout_latch == 4);
   CHECK(cfg.link.ladder_cfg.hold_after_down_ms == 4000);
   CHECK(cfg.link.ladder_cfg.min_between_changes_ms == 150);
   CHECK(cfg.link.ladder_cfg.feedback_timeout_ms == 1000);
 
   auto cfg2 = maburgs::load_config(write_tmp(
-      "[link]\ndown_util = 0.5\nclean_ms = 4000\npenalty_max_ms = 30000\n"));
+      "[link]\ndown_util = 0.5\nclean_ms = 4000\npenalty_max_ms = 30000\n"
+      "lockout_ms = 30000\nlockout_latch = 3\n"));
   CHECK(cfg2.link.ladder_cfg.down_util > 0.499 && cfg2.link.ladder_cfg.down_util < 0.501);
   CHECK(cfg2.link.ladder_cfg.clean_ms == 4000);
   CHECK(cfg2.link.ladder_cfg.penalty_max_ms == 30000);
+  CHECK(cfg2.link.ladder_cfg.lockout_ms == 30000);
+  CHECK(cfg2.link.ladder_cfg.lockout_latch == 3);
 }
 
 TEST(au_ring_defaults) {

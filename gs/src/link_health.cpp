@@ -144,7 +144,8 @@ LinkHealthAssembler::Tick LinkHealthAssembler::tick(double now_ms,
   // decoder's own abandonment count, mirroring s3_resid_cur below. See
   // gs/src/ladder_residual.cpp for why this replaced the packet-level
   // delivery window.
-  const auto s1_rc = maburgs::ladder_residual_counts(agg.decoder());
+  const auto s1_rc = maburgs::ladder_residual_counts(
+      agg.decoder(), cfg_.nack_residual, in.nack_late_fills);
   s1_resid_cur_.add(s1_rc.expected, s1_rc.arrived, now_ms);
   const auto s1_rcur_sample = s1_resid_cur_.sample(now_ms);
 
@@ -156,11 +157,11 @@ LinkHealthAssembler::Tick LinkHealthAssembler::tick(double now_ms,
   s3_loss_.add(s3.arr_expected, s3.arr_arrived, now_ms);
   const auto s3_sample = s3_loss_.sample(now_ms);
 
-  // + syms_retx mirrors ladder_residual.cpp's abandoned term (enh never has
-  // retx today; keeps the two paths symmetric).
-  const uint64_t s3_ab_cur =
-      s3.syms_abandoned - s3.syms_abandoned_stale + s3.syms_retx;
-  const uint64_t s3_exp_cur = s3.syms_delivered + s3.syms_recovered + s3_ab_cur;
+  // A retx-filled symbol counts as arrived, as in ladder_residual_counts
+  // (enh never has retx today; keeps the two paths symmetric).
+  const uint64_t s3_ab_cur = s3.syms_abandoned - s3.syms_abandoned_stale;
+  const uint64_t s3_exp_cur =
+      s3.syms_delivered + s3.syms_recovered + s3.syms_retx + s3_ab_cur;
   s3_loss_cur_.add(s3.arr_expected - s3.arr_expected_stale,
                   s3.arr_arrived - s3.arr_arrived_stale, now_ms);
   s3_resid_cur_.add(s3_exp_cur, s3_exp_cur - s3_ab_cur, now_ms);

@@ -38,9 +38,10 @@ struct ChannelPlanCfg {
 // -- the pin, else the start channel, later the committed pick. A DISC only
 // finds the drone: when the ack that opens a session was heard on a member
 // X != op, link_found() moves op_ to X for every card (the link forms
-// where the drone is), and the caller relocates it to want_ with an
-// ordinary hop order (relocate_due()). Every move of a linked link is a
-// hop order.
+// where the drone is). The caller then either sets want_ to X (auto mode,
+// when the ranking does not earn the move: ChannelCore::keep_found_link_)
+// or relocates the link to want_ with an ordinary hop order
+// (relocate_due()). Every move of a linked link is a hop order.
 class ChannelPlan {
  public:
   explicit ChannelPlan(ChannelPlanCfg cfg);
@@ -60,8 +61,10 @@ class ChannelPlan {
   // accepting the channel the link is on, or wanting a pick while linked.
   void set_want(double now_ms, uint8_t ch);
   // The ack that opened the session was heard on x: the link forms there.
-  // op_ = x for every card, M all <op> <x> link_found. x == op_, not a
-  // member, or a hop in flight: no-op.
+  // op_ = x for every card, M all <op> <x> link_found. x may be a 5 GHz grid
+  // channel outside the set (the scout's grid search found the drone there;
+  // relocate_due() then brings the link back to want_). x == op_, neither a
+  // member nor a grid channel, or a hop in flight: no-op.
   void link_found(double now_ms, uint8_t x);
   // In session, no hop in flight, and the link is not where it should be.
   bool relocate_due() const { return in_session_ && !hopping_ && op_ != want_; }

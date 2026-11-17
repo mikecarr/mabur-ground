@@ -33,7 +33,7 @@ VrxController::VrxController(VrxCfg cfg)
       // BEACONING after video loss only delays re-rendezvous. The removed
       // link.video_silence_ms key claimed to tune the 1000 but never did.
       // nonce 0 = random per process: a restarted GS is a new session.
-      rz_(VrxRzConfig{1000, 20, cfg.op_channel, cfg.rz_nonce}),
+      rz_(VrxRzConfig{1000, 20, cfg.op_channel, cfg.rz_nonce, cfg.width}),
       cur_op_(op_from_rung(ctrl_.op())) {}
 
 void VrxController::sync_op_() { cur_op_ = op_from_rung(ctrl_.op()); }
@@ -51,6 +51,8 @@ void VrxController::on_rc_frame(const uint8_t* buf, size_t len, double now_ms) {
   peer_caps_ = ack->chip_caps;
   peer_acked_ = true;
   if (adopted_new) {
+    // A new drone session: the loss that struck the rungs was the old one's.
+    ctrl_.clear_lockout();
     seq32_ = 0;
     rcfs_since_adopt_ = 0;
     move_armed_ = true;
@@ -151,7 +153,10 @@ mabur::rc::Rcf VrxController::build_rcf() {
 }
 
 void VrxController::restore_rung(int rung, double now_ms) {
-  ctrl_.restore(rung, now_ms);
+  // rung < 0: the verdict froze no reference, as on a move off a healthy
+  // link. Stay on the current rung; rung 0 would cut the link's capacity to
+  // its floor while the encoder and the queue still run at this rate.
+  ctrl_.restore(rung < 0 ? ctrl_.rung() : rung, now_ms);
   sync_op_();
 }
 

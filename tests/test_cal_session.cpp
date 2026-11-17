@@ -1190,4 +1190,442 @@ TEST(null_log_sink_is_inert) {
   CHECK(s.state() == State::Done);
 }
 
+
+// ---- floor sweep ----------------------------------------------------------
+
+namespace {
+
+cal::SweepDone floor_done(uint32_t nonce, uint8_t seq, uint8_t found, uint8_t tried) {
+  cal::FloorReport r;
+  r.ref_fps = 2484;
+  r.floor = found;
+  r.tried = tried;
+  r.confirm_pct = found ? 100 : 0;
+  for (uint8_t i = 0; i < tried; ++i) r.min_fps[i] = (found && i + 1 == tried) ? 2484 : 0;
+  return cal::pack_floor_done(nonce, seq, r);
+}
+
+}  // namespace
+
+TEST(floor_sorts_first_within_40_and_is_commanded_as_built) {
+  CalSession s(CalSessionCfg{});
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  std::string err;
+  REQUIRE(s.start(1,
+                  {{Kind::Capacity, 40}, {Kind::Power, 40}, {Kind::Floor, 40},
+                   {Kind::Power, 20}, {Kind::Floor, 40}},
+                  0, &err));
+  const auto& v = s.sweeps();
+  REQUIRE(v.size() == 4);
+  CHECK(v[0].kind == Kind::Power && v[0].bw == 20);
+  CHECK(v[1].kind == Kind::Floor && v[1].bw == 40);
+  CHECK(v[2].kind == Kind::Power && v[2].bw == 40);
+  CHECK(v[3].kind == Kind::Capacity && v[3].bw == 40);
+
+  CalSession t(CalSessionCfg{});
+  t.set_peer(true, true);
+  t.set_peer_wide(true);
+  REQUIRE(t.start(2, {{Kind::Floor, 40}}, 0, &err));
+  const auto cmd = as<cal::SweepCmd>(t.due_mav(0));
+  REQUIRE(cmd.has_value());
+  const auto want = cal::make_floor_sweep(2, 0);
+  CHECK(cmd->kind == Kind::Floor && cmd->bw == 40);
+  CHECK(cmd->idx_lo == want.idx_lo && cmd->idx_hi == want.idx_hi);
+  CHECK(cmd->dwell_ms == want.dwell_ms && cmd->settle_ms == want.settle_ms);
+  CHECK(cmd->mcs_mask == want.mcs_mask);
+  CHECK(t.snapshot().cell_n == 12);
+
+  CalSession u(CalSessionCfg{});
+  u.set_peer(true, true);
+  u.set_peer_wide(true);
+  CHECK(!u.start(3, {{Kind::Floor, 20}}, 0, &err));
+  CHECK(err.find("40 MHz") != std::string::npos);
+}
+
+TEST(a_found_floor_is_written_with_its_margin_and_the_run_goes_on) {
+  CalSession s(CalSessionCfg{});
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  std::string err;
+  REQUIRE(s.start(5, {{Kind::Floor, 40}, {Kind::Power, 40}}, 0, &err));
+  REQUIRE(as<cal::SweepCmd>(s.due_mav(0)).has_value());
+  ack(s, 5, 0, 10);
+  CHECK(s.radio_silent(20));
+  // Frames show which candidate is on the air; nothing is tallied.
+  s.on_cal_frame(0, stamp(Kind::Floor, cal::kFloorMcs, 2, 40, kFlags), -60, true, 1400, 20);
+  CHECK(s.snapshot().cell_i == 3);
+  s.on_mav(floor_done(5, 0, 0x24, 3), 30000);
+  const auto a = as<cal::ApplyCmd>(s.due_mav(30010));
+  REQUIRE(a.has_value());
+  CHECK(a->has_floor);
+  CHECK(a->floor == 0x35);  // 0x24 + 4 steps is under the default
+  CHECK(!a->has_walls);
+  CHECK(!a->has_eff);
+  CHECK(a->bw == 40);
+  s.on_mav(cal::Applied{5, 0, 40, true, ""}, 30020);
+  const auto snap = s.snapshot();
+  CHECK(snap.floor.ran);
+  CHECK(snap.floor.have);
+  CHECK(snap.floor.rep.floor == 0x24);
+  CHECK(snap.floor.written == 0x35);
+  CHECK(!snap.floor.below_range);
+  CHECK(snap.floor.applied);
+  CHECK(snap.state == State::AwaitAck);
+  CHECK(snap.sweep_i == 1);
+}
+
+TEST(the_written_floor_is_the_edge_plus_margin_never_under_the_default) {
+  CHECK(cal::kFloorDefault == 0x35);
+  CHECK(cal::floor_to_write(0x24) == 0x35);  // needs 0x28: the default stays
+  CHECK(cal::floor_to_write(0x31) == 0x35);
+  CHECK(cal::floor_to_write(0x32) == 0x36);
+  CHECK(cal::floor_to_write(0x34) == 0x38);  // needs more: raised
+  CHECK(cal::floor_to_write(0x7c) == 0x7f);
+  CHECK(cal::floor_to_write(0x7e) == 0x7f);  // clamped to the IGI field
+}
+
+TEST(a_floor_that_passes_at_the_lowest_candidate_reports_no_edge) {
+  CalSession s(CalSessionCfg{});
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  std::string err;
+  REQUIRE(s.start(8, {{Kind::Floor, 40}}, 0, &err));
+  REQUIRE(as<cal::SweepCmd>(s.due_mav(0)).has_value());
+  ack(s, 8, 0, 10);
+  s.on_mav(floor_done(8, 0, cal::kFloorLo, 1), 20000);
+  const auto a = as<cal::ApplyCmd>(s.due_mav(20010));
+  REQUIRE(a.has_value());
+  CHECK(a->floor == cal::kFloorDefault);
+  const auto snap = s.snapshot();
+  CHECK(snap.floor.below_range);
+  CHECK(snap.floor.written == 0x35);
+}
+
+TEST(a_unit_that_needs_more_than_the_default_gets_it_raised) {
+  CalSession s(CalSessionCfg{});
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  std::string err;
+  REQUIRE(s.start(9, {{Kind::Floor, 40}}, 0, &err));
+  REQUIRE(as<cal::SweepCmd>(s.due_mav(0)).has_value());
+  ack(s, 9, 0, 10);
+  s.on_mav(floor_done(9, 0, 0x34, 11), 60000);
+  const auto a = as<cal::ApplyCmd>(s.due_mav(60010));
+  REQUIRE(a.has_value());
+  CHECK(a->floor == 0x38);
+  CHECK(!s.snapshot().floor.below_range);
+}
+
+TEST(no_passing_floor_writes_nothing_and_says_so) {
+  CalSession s(CalSessionCfg{});
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  std::string err;
+  REQUIRE(s.start(6, {{Kind::Floor, 40}}, 0, &err));
+  REQUIRE(as<cal::SweepCmd>(s.due_mav(0)).has_value());
+  ack(s, 6, 0, 10);
+  s.on_mav(floor_done(6, 0, 0, 12), 60000);
+  const auto snap = s.snapshot();
+  CHECK(snap.state == State::Done);
+  CHECK(snap.floor.have);
+  CHECK(snap.floor.written == 0);
+  CHECK(snap.floor.note == "no floor passed");
+}
+
+TEST(a_lost_floor_report_writes_nothing) {
+  CalSession s(CalSessionCfg{});
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  std::string err;
+  REQUIRE(s.start(7, {{Kind::Floor, 40}}, 0, &err));
+  REQUIRE(as<cal::SweepCmd>(s.due_mav(0)).has_value());
+  ack(s, 7, 0, 10);
+  const uint32_t window =
+      cal::floor_sweep_max_ms(cal::make_floor_sweep(7, 0)) + CalSessionCfg{}.phase_slack_ms;
+  CHECK(s.radio_silent(10 + window - 1));
+  s.due_mav(10 + window + 1);
+  const auto snap = s.snapshot();
+  CHECK(snap.state == State::Done);
+  CHECK(!snap.floor.have);
+  CHECK(snap.floor.written == 0);
+  CHECK(snap.floor.note == "the floor sweep's result was lost");
+}
+
+TEST(a_peer_without_the_floor_sweep_runs_the_rest) {
+  CalSession s(CalSessionCfg{});
+  s.set_peer(true, true);  // no CAP_CAL_WIDE
+  std::string err;
+  REQUIRE(s.start(8, {{Kind::Power, 20}, {Kind::Floor, 40}}, 0, &err));
+  REQUIRE(s.sweeps().size() == 1);
+  CHECK(s.sweeps()[0].kind == Kind::Power);
+  CHECK(s.snapshot().floor.note == "peer does not support the floor sweep");
+  CalSession t(CalSessionCfg{});
+  t.set_peer(true, true);
+  CHECK(!t.start(9, {{Kind::Floor, 40}}, 0, &err));
+  CHECK(err == "refused: peer does not support the floor sweep");
+}
+
+TEST(an_unsupported_floor_ack_moves_on_to_the_next_sweep) {
+  CalSession s(CalSessionCfg{});
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  std::string err;
+  REQUIRE(s.start(10, {{Kind::Floor, 40}, {Kind::Power, 40}}, 0, &err));
+  REQUIRE(as<cal::SweepCmd>(s.due_mav(0)).has_value());
+  ack(s, 10, 0, 10, kFlags, cal::AckResult::Unsupported);
+  const auto snap = s.snapshot();
+  CHECK(snap.state == State::AwaitAck);
+  CHECK(snap.sweep_i == 1);
+  CHECK(snap.floor.note == "peer does not support the floor sweep");
+  const auto cmd = as<cal::SweepCmd>(s.due_mav(20));
+  REQUIRE(cmd.has_value());
+  CHECK(cmd->kind == Kind::Power && cmd->bw == 40);
+}
+
+TEST(floor_rows_land_in_the_cal_log) {
+  const auto dir = fresh_dir("cal_session_floor_log");
+  CalLog log(dir);
+  log.header();
+  CalSession s(CalSessionCfg{}, &log);
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  std::string err;
+  REQUIRE(s.start(11, {{Kind::Floor, 40}}, 0, &err));
+  REQUIRE(as<cal::SweepCmd>(s.due_mav(0)).has_value());
+  ack(s, 11, 0, 10);
+  s.on_mav(floor_done(11, 0, 0x22, 2), 30000);
+  REQUIRE(as<cal::ApplyCmd>(s.due_mav(30010)).has_value());
+  s.on_mav(cal::Applied{11, 0, 40, true, ""}, 30020);
+  log.flush();
+  const auto ls = cal_log_lines(dir);
+  REQUIRE(ls.size() >= 6);
+  CHECK(ls[2] == "S 0 floor 40 4000");
+  CHECK(ls[3] == "F 32 0");
+  CHECK(ls[4] == "F 34 2484");
+  CHECK(ls[5] == "L 2484 34 100 53 0 0");  // edge 0x22, the default written
+}
+
+
+// ---- both widths in one run -------------------------------------------------
+
+namespace {
+
+// Runs power20 of a run started at 0 through its apply and verify; returns
+// the next sweep's SweepCmd, offered at `t`.
+std::optional<cal::SweepCmd> pass_power20(CalSession& s, uint32_t nonce, uint64_t t = 100000) {
+  run_power(s, nonce, 0, 20, kWalls, 0);
+  s.on_mav(cal::Applied{nonce, 0, 20, true, ""}, 100);
+  return as<cal::SweepCmd>(s.due_mav(t));
+}
+
+CalSession wide_session() {
+  CalSession s(CalSessionCfg{});
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  return s;
+}
+
+}  // namespace
+
+TEST(cal_width_holds_the_cards_at_40_only_for_a_40_mhz_sweep) {
+  CalSession s = wide_session();
+  std::string err;
+  CHECK(s.cal_width() == 0);
+  REQUIRE(s.start(40, {{Kind::Power, 20}, {Kind::Floor, 40}}, 0, &err));
+  CHECK(s.cal_width() == 0);
+  const auto cmd = pass_power20(s, 40);
+  REQUIRE(cmd.has_value());
+  CHECK(cmd->kind == Kind::Floor);
+  CHECK(s.cal_width() == 40);
+  ack(s, 40, 1, 100010);
+  CHECK(s.cal_width() == 40);
+  s.on_mav(floor_done(40, 1, 0x24, 3), 130000);
+  REQUIRE(as<cal::ApplyCmd>(s.due_mav(130010)).has_value());
+  CHECK(s.cal_width() == 40);
+  s.on_mav(cal::Applied{40, 1, 40, true, ""}, 130020);
+  CHECK(s.state() == State::Done);
+  CHECK(s.cal_width() == 0);
+}
+
+TEST(no_pair_skips_the_40_mhz_part_and_keeps_the_20_mhz_one) {
+  CalSession s = wide_session();
+  std::string err;
+  REQUIRE(s.start(41, {{Kind::Power, 20}, {Kind::Floor, 40}, {Kind::Power, 40},
+                       {Kind::Capacity, 40}},
+                  0, &err));
+  REQUIRE(pass_power20(s, 41).has_value());
+  ack(s, 41, 1, 100010, kFlags, cal::AckResult::NoPair);
+  const auto snap = s.snapshot();
+  CHECK(snap.state == State::Done);
+  CHECK(snap.width[0].applied);
+  CHECK(snap.width[1].skipped.find("no 40 MHz pair") != std::string::npos);
+  CHECK(snap.width[1].skipped.rfind("floor: ", 0) == 0);
+  CHECK(snap.floor.note == "no 40 MHz pair");
+  CHECK(s.cal_width() == 0);
+  // The drone's run is closed at once, as at any other Done.
+  CHECK(as<cal::Abort>(s.due_mav(100020)).has_value());
+}
+
+TEST(no_floor_passing_skips_the_40_mhz_sweeps_after_it) {
+  CalSession s = wide_session();
+  std::string err;
+  REQUIRE(s.start(42, {{Kind::Power, 20}, {Kind::Floor, 40}, {Kind::Power, 40}}, 0, &err));
+  REQUIRE(pass_power20(s, 42).has_value());
+  ack(s, 42, 1, 100010);
+  s.on_mav(floor_done(42, 1, 0, 12), 170000);
+  const auto snap = s.snapshot();
+  CHECK(snap.state == State::Done);
+  CHECK(snap.width[0].applied);
+  CHECK(snap.width[1].skipped == "floor: no floor passed");
+  CHECK(!snap.width[1].have_walls);
+}
+
+// A busy channel shows no edge (the drone's verdict, FloorReport::noisy): the
+// floor result says so, nothing is written, and the 40 MHz sweeps after it
+// run at the floor the drone's file already holds.
+TEST(a_floor_sweep_on_a_busy_channel_writes_nothing_and_40_mhz_goes_on) {
+  CalSession s = wide_session();
+  std::string err;
+  REQUIRE(s.start(47, {{Kind::Power, 20}, {Kind::Floor, 40}, {Kind::Power, 40}}, 0, &err));
+  REQUIRE(pass_power20(s, 47).has_value());
+  ack(s, 47, 1, 100010);
+  cal::FloorReport r;
+  r.ref_fps = 2484;
+  r.heard_fps = 190;
+  r.noisy = true;
+  s.on_mav(cal::pack_floor_done(47, 1, r), 105000);
+  auto snap = s.snapshot();
+  CHECK(snap.floor.have);
+  CHECK(snap.floor.noisy);
+  CHECK(snap.floor.written == 0);
+  CHECK(snap.floor.note == "the channel is not quiet: the drone heard 190 frames/s");
+  CHECK(snap.width[1].skipped.empty());
+  CHECK(snap.state != State::Done);
+  const auto next = as<cal::SweepCmd>(s.due_mav(105010));
+  REQUIRE(next.has_value());
+  CHECK(next->kind == Kind::Power);
+  CHECK(next->bw == 40);
+}
+
+TEST(a_saturated_heard_count_reads_as_a_lower_bound) {
+  CalSession s(CalSessionCfg{});
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  std::string err;
+  REQUIRE(s.start(48, {{Kind::Floor, 40}}, 0, &err));
+  REQUIRE(as<cal::SweepCmd>(s.due_mav(0)).has_value());
+  ack(s, 48, 0, 10);
+  cal::FloorReport r;
+  r.ref_fps = 2682;
+  r.tried = 1;
+  r.min_fps[0] = 1635;
+  r.heard_fps = 0xFF;
+  r.noisy = true;
+  s.on_mav(cal::pack_floor_done(48, 0, r), 9000);
+  CHECK(s.snapshot().floor.note == "the channel is not quiet: the drone heard 255 or more frames/s");
+}
+
+// The drone judges the channel, with two bounds the GS does not repeat: a
+// count over either of them in a report that is not marked noisy is a
+// measurement like any other.
+TEST(a_floor_report_is_noisy_only_when_the_drone_says_so) {
+  CalSession s(CalSessionCfg{});
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  std::string err;
+  REQUIRE(s.start(49, {{Kind::Floor, 40}}, 0, &err));
+  REQUIRE(as<cal::SweepCmd>(s.due_mav(0)).has_value());
+  ack(s, 49, 0, 10);
+  cal::FloorReport r;
+  r.ref_fps = 2682;
+  r.floor = 0x24;
+  r.tried = 3;
+  r.confirm_pct = 100;
+  r.heard_fps = 8;
+  s.on_mav(cal::pack_floor_done(49, 0, r), 30000);
+  const auto snap = s.snapshot();
+  CHECK(!snap.floor.noisy);
+  CHECK(snap.floor.written == 0x35);
+}
+
+TEST(a_refused_40_mhz_apply_leaves_the_run_done_with_40_uncalibrated) {
+  CalSession s = wide_session();
+  std::string err;
+  REQUIRE(s.start(43, {{Kind::Power, 20}, {Kind::Power, 40}, {Kind::Capacity, 40}}, 0, &err));
+  REQUIRE(pass_power20(s, 43).has_value());
+  run_power(s, 43, 1, 40, kWalls, 100300);
+  s.on_mav(cal::Applied{43, 1, 40, false, "config line not found"}, 100400);
+  const auto snap = s.snapshot();
+  CHECK(snap.state == State::Done);
+  CHECK(snap.fail_reason.empty());
+  CHECK(snap.width[0].applied);
+  CHECK(!snap.width[1].applied);
+  CHECK(snap.width[1].skipped == "power40: apply refused by the drone: config line not found");
+}
+
+TEST(a_40_mhz_ack_timeout_after_20_is_skipped_but_alone_still_fails) {
+  CalSessionCfg cfg;
+  {
+    CalSession s = wide_session();
+    std::string err;
+    REQUIRE(s.start(44, {{Kind::Power, 20}, {Kind::Power, 40}}, 0, &err));
+    REQUIRE(pass_power20(s, 44).has_value());
+    s.due_mav(100000 + cfg.ack_timeout_ms);
+    CHECK(s.state() == State::Done);
+    CHECK(s.snapshot().width[1].skipped == "power40: calibration ack timeout");
+  }
+  {
+    CalSession s = wide_session();
+    std::string err;
+    REQUIRE(s.start(45, {{Kind::Power, 40}}, 0, &err));
+    REQUIRE(s.due_mav(0).has_value());
+    s.due_mav(cfg.ack_timeout_ms);
+    CHECK(s.state() == State::Failed);
+    CHECK(s.snapshot().width[1].skipped.empty());
+  }
+}
+
+TEST(a_refused_40_mhz_ack_after_20_is_skipped) {
+  CalSession s = wide_session();
+  std::string err;
+  REQUIRE(s.start(46, {{Kind::Power, 20}, {Kind::Power, 40}}, 0, &err));
+  REQUIRE(pass_power20(s, 46).has_value());
+  ack(s, 46, 1, 100010, kFlags, cal::AckResult::Busy);
+  CHECK(s.state() == State::Done);
+  CHECK(s.snapshot().width[1].skipped == "power40: sweep refused by the drone: busy");
+}
+
+TEST(a_refused_floor_apply_skips_the_40_mhz_part) {
+  CalSession s = wide_session();
+  std::string err;
+  REQUIRE(s.start(47, {{Kind::Power, 20}, {Kind::Floor, 40}, {Kind::Power, 40}}, 0, &err));
+  REQUIRE(pass_power20(s, 47).has_value());
+  ack(s, 47, 1, 100010);
+  s.on_mav(floor_done(47, 1, 0x24, 3), 130000);
+  REQUIRE(as<cal::ApplyCmd>(s.due_mav(130010)).has_value());
+  s.on_mav(cal::Applied{47, 1, 40, false, "no wide_tx_igi_floor key"}, 130020);
+  const auto snap = s.snapshot();
+  CHECK(snap.state == State::Done);
+  CHECK(!snap.floor.applied);
+  CHECK(snap.width[1].skipped == "floor: floor apply refused by the drone: no wide_tx_igi_floor key");
+}
+
+TEST(skipped_rows_land_in_the_cal_log) {
+  const auto dir = fresh_dir("cal_session_skip_log");
+  CalLog log(dir);
+  log.header();
+  CalSession s(CalSessionCfg{}, &log);
+  s.set_peer(true, true);
+  s.set_peer_wide(true);
+  std::string err;
+  REQUIRE(s.start(48, {{Kind::Power, 20}, {Kind::Floor, 40}}, 0, &err));
+  REQUIRE(pass_power20(s, 48).has_value());
+  ack(s, 48, 1, 100010, kFlags, cal::AckResult::NoPair);
+  log.flush();
+  const auto ls = cal_log_lines(dir);
+  REQUIRE(!ls.empty());
+  CHECK(ls.back() == "N 40 floor: ch 0 has no 40 MHz pair");
+}
+
 MTEST_MAIN

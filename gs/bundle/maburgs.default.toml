@@ -82,6 +82,8 @@ clean_ms               = 1500
 probation_ms           = 3000   # after stepping up, a quick fall back counts as a failed promote
 penalty_base_ms        = 5000   # a failed rung is blocked this long, doubling on repeats...
 penalty_max_ms         = 10000  # ...up to this
+lockout_ms             = 0      # a rung left on loss is locked this long (0 = off)...
+lockout_latch          = 4      # ...and the latch-th such loss locks it until a hop or a new session
 hold_after_down_ms     = 0      # wait after stepping down before stepping up again
 min_between_changes_ms = 150    # minimum time between any two rung changes
 feedback_timeout_ms    = 1000   # no link reports this long = fall to the most robust rung
@@ -93,6 +95,12 @@ s3_demote              = true   # step down on enhance-layer loss too
 s3_down_util           = 0.15   # enhance-layer loss level that triggers a step down
 s3_min_syms            = 50     # below this much traffic, a window tells us nothing
 s3_settle_ms           = 300    # ignore this check just after a rung change
+
+# What a piece the software NACK (see [link.nack]) got re-sent counts as
+# when the link decides whether to step down: "filled" = arrived, "all" =
+# lost (as if no re-send came), "timely" = arrived only if it came before
+# the frame gave up on it (frame_gap_timeout_ms).
+nack_residual          = "filled"
 
 static_overhead_base   = 0.5    # FEC overhead with static_mcs only
 static_overhead_enh    = 0.5    # ...and on the enhance layer

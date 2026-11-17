@@ -491,6 +491,66 @@ class TestReportV5(unittest.TestCase):
         self.assertNotIn(3, self._parse(text)[0].caps_by_bw[20])
 
 
+# callog 6: GOOD5 with a floor sweep between the 20 and 40 MHz sweeps; 0x20
+# stalled, 0x22 held its dwell and then failed its confirmation, 0x24
+# confirmed and the default 0x35 was written.
+GOOD6 = (GOOD5.replace("callog 5", "callog 6", 1)
+         .replace("S 3 power 40 20\n",
+                  "S 6 floor 40 4000\nF 32 0\nF 34 2484\nF 36 2484\n"
+                  "L 2484 36 100 53 1 0\nA 40 1 \nS 3 power 40 20\n"))
+
+GOOD6_NONE = (GOOD5.replace("callog 5", "callog 6", 1)
+              .replace("S 3 power 40 20\n",
+                       "S 6 floor 40 4000\nF 32 0\nF 34 0\nL 2484 0 0 0 0 0\n"
+                       "S 3 power 40 20\n"))
+
+
+class TestReportV6(unittest.TestCase):
+    """callog 6 adds the floor sweep's F and L rows under `S <seq> floor`."""
+
+    def test_floor_found_and_written(self):
+        out = render(GOOD6)
+        self.assertIn("floor40: floor edge 0x24 (100% worst second confirmed), 0x35 written", out)
+        self.assertIn("0x20:0 0x22:2484 0x24:2484", out)
+        # The floor rows open no width block and leave the 40 MHz table as it was.
+        row0 = [l for l in out.splitlines() if l.startswith("mcs0")][0]
+        self.assertIn("60", row0)
+
+    def test_never_stalled_reports_no_edge(self):
+        never = (GOOD5.replace("callog 5", "callog 6", 1)
+                 .replace("S 3 power 40 20\n",
+                          "S 6 floor 40 4000\nF 32 2484\nL 2484 32 100 53 0 0\n"
+                          "A 40 1 \nS 3 power 40 20\n"))
+        self.assertIn("floor40: floor edge none found at or above 0x20, 0x35 written",
+                      render(never))
+
+    def test_a_skipped_width_says_why(self):
+        skipped = (GOOD5.replace("callog 5", "callog 6", 1)
+                   .replace("S 3 power 40 20\n",
+                            "S 6 floor 40 4000\nN 40 floor: ch 165 has no 40 MHz pair\n"
+                            "S 3 power 40 20\n"))
+        out = render(skipped)
+        self.assertIn("40 MHz uncalibrated: floor: ch 165 has no 40 MHz pair", out)
+        self.assertNotIn("uncalibrated", render(GOOD6))
+
+    def test_a_busy_channel_is_not_a_measurement(self):
+        busy = (GOOD5.replace("callog 5", "callog 6", 1)
+                .replace("S 3 power 40 20\n",
+                         "S 6 floor 40 4000\nL 2862 0 0 0 190 1\nS 3 power 40 20\n"))
+        out = render(busy)
+        self.assertIn("floor40: not measured, the channel is not quiet "
+                      "(the drone heard 190 frames/s); nothing written, "
+                      "the floor in the file stays", out)
+        self.assertNotIn("uncalibrated", out)
+
+    def test_no_floor_passed(self):
+        out = render(GOOD6_NONE)
+        self.assertIn("floor40: no value passed; nothing written", out)
+
+    def test_v5_has_no_floor_line(self):
+        self.assertNotIn("floor40", render(GOOD5))
+
+
 class TestCallogVersions(unittest.TestCase):
     """The marker versions the FILE. maburgs writes 1; 2 is accepted because
     bench runs in that shape (the reverted EVM columns, docs/calibration.md)

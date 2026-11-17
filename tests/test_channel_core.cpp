@@ -179,7 +179,7 @@ TEST(disc_targets_follow_scan_disc_targets_while_scout_owns) {
   CHECK(std::find(t.begin(), t.end(), 1) == t.end());   // not beaconing yet
 }
 
-TEST(disc_for_card_retags_only_members) {
+TEST(disc_for_card_retags_members_and_grid_channels) {
   Rig g(2, 0);
   mabur::rc::Disc d; d.vrx_nonce = 7; d.op_channel = 40; d.op_width = 40; d.seq = 1;
   const auto frame = mabur::rc::pack_disc(d, g.cfg.link.key);
@@ -188,9 +188,27 @@ TEST(disc_for_card_retags_only_members) {
   const auto p1 = mabur::rc::parse_disc(f1.data(), f1.size());
   REQUIRE(p1.has_value());
   CHECK(p1->op_channel == 64);
-  g.cards[1]->ch = 60;                                   // not a member
+  g.cards[1]->ch = 60;                                   // a grid channel outside the set
   const auto f2 = g.core->disc_for_card(frame, 1);
-  CHECK(f2 == frame);
+  const auto p2 = mabur::rc::parse_disc(f2.data(), f2.size());
+  REQUIRE(p2.has_value());
+  CHECK(p2->op_channel == 60);
+  g.cards[1]->ch = 68;                                   // off the grid
+  const auto f3 = g.core->disc_for_card(frame, 1);
+  CHECK(f3 == frame);
+}
+
+// The grid search found the drone outside the set: the link forms there.
+// Revert (members only): a drone another GS left off the set is never linked.
+TEST(session_opened_on_a_grid_channel_outside_the_set_moves_op_there) {
+  Rig g(2, 0);
+  g.core->on_rc_body(100);
+  mabur::rc::DiscAck ack; ack.vrx_nonce = g.vrx->rz_nonce(); ack.vtx_nonce = 1;
+  ack.chip_caps = mabur::rc::CAP_FRAME_WIRE; ack.agreed_channel = 100; ack.seq = 1;
+  g.core->on_session_opened(ack, 1000.0);
+  CHECK(g.core->op() == 100);
+  CHECK(g.vrx->proposal() == 100);
+  CHECK(g.sink.has_line("drone found on 100 (op 40): the link forms there (outside the set)"));
 }
 
 TEST(session_opened_elsewhere_moves_op_there) {
@@ -216,7 +234,7 @@ TEST(session_opened_with_key_mismatch_or_foreign_nonce_is_ignored) {
   ack.flags = 0; ack.vrx_nonce = g.vrx->rz_nonce() + 1;
   g.core->on_session_opened(ack, 1000.0);
   CHECK(g.core->op() == 40);
-  g.core->on_rc_body(60);               // not a member
+  g.core->on_rc_body(68);               // off the grid
   ack.vrx_nonce = g.vrx->rz_nonce();
   g.core->on_session_opened(ack, 1000.0);
   CHECK(g.core->op() == 40);
@@ -548,6 +566,17 @@ static void onset_then_swap(Rig& g, std::vector<Rung> new_rungs) {
   LadderCfg nl = g.vrx->ladder();
   nl.ladder = std::move(new_rungs);
   g.core->replace_ladder(nl, static_cast<double>(g.clk.ms));
+}
+// A move off a healthy link has no frozen reference. Revert = the -1 clamps
+// to rung 0 and the link drops to its floor on an operator's channel change.
+TEST(hop_restore_without_a_reference_keeps_the_rung) {
+  Rig g(2, 0);
+  link_up(g);
+  g.vrx->restore_rung(2, static_cast<double>(g.clk.ms));
+  REQUIRE(g.vrx->cur_op().mcs == 2);
+  g.vrx->restore_rung(-1, static_cast<double>(g.clk.ms));
+  CHECK(g.vrx->cur_op().mcs == 2);
+  CHECK(std::string(to_string(g.vrx->ctl().last_event().reason)) == "hop_restore");
 }
 TEST(hop_restore_survives_ladder_swap) {
   Rig g(2, 0); freeze_auto(g);
@@ -1047,6 +1076,53 @@ TEST(one_card_link_edge_freezes_one_card_linked) {
   CHECK(std::string(g.core->snapshot(0).scan_state) == "frozen");
   REQUIRE(g.core->snapshot(0).scan_pick.has_value());
   CHECK(*g.core->snapshot(0).scan_pick == g.core->op());
+}
+
+// One card, the prelude done, then the drone found on 144 (the bench
+// 2026-11-14, fl-0001: the GS relocated a working link 144 -> 36 on a pick
+// with no busy reading). want is what the prelude chose against the start
+// channel, not against 144: it moves the link only when the ranking, with
+// 144 as current, earns it.
+static void one_card_found_on_144(Rig& g) {
+  for (int i = 0; i < 800 && !g.sink.has_line("one-card prelude ranking picks"); ++i) g.tick();
+  REQUIRE(g.sink.has_line("one-card prelude ranking picks"));
+  g.core->on_rc_body(144);
+  mabur::rc::DiscAck ack; ack.vrx_nonce = g.vrx->rz_nonce(); ack.vtx_nonce = 1; ack.agreed_channel = 144; ack.seq = 1;
+  g.core->on_session_opened(ack, static_cast<double>(g.clk.ms));
+  REQUIRE(g.core->op() == 144);
+  link_up(g);
+  g.vrx->test_set_move_edge();
+  for (int i = 0; i < 200 && !g.sink.has_line("relocate 144 -> "); ++i) g.tick(true);
+}
+
+TEST(a_link_found_on_a_channel_the_ranking_does_not_beat_stays_there) {
+  Rig g(1, 0);                         // no busy reading anywhere: want stays the start channel 40
+  one_card_found_on_144(g);
+  CHECK(g.sink.has_line("maburgs channel: 40 does not out-rank 144 where the link formed: staying"));
+  CHECK(!g.sink.has_line("relocate 144 -> "));
+  CHECK(g.core->op() == 144);
+  CHECK(g.sink.has_line("pick frozen on 144 (one-card linked)"));
+  // Read, but under the margin: 64 is what the prelude committed, 144 as quiet.
+  Rig h(1, 0);
+  h.cards[0]->nhm_busy_pct_on[40] = 100;
+  h.cards[0]->nhm_busy_pct_on[64] = 0;
+  h.cards[0]->nhm_busy_pct_on[112] = 100;
+  h.cards[0]->nhm_busy_pct_on[144] = 4;
+  one_card_found_on_144(h);
+  CHECK(h.sink.has_line("maburgs channel: 64 does not out-rank 144 where the link formed: staying"));
+  CHECK(!h.sink.has_line("relocate 144 -> "));
+  CHECK(h.core->op() == 144);
+}
+
+TEST(a_link_found_on_a_channel_the_ranking_beats_moves_to_the_pick) {
+  Rig g(1, 0);
+  g.cards[0]->nhm_busy_pct_on[40] = 100;
+  g.cards[0]->nhm_busy_pct_on[64] = 0;
+  g.cards[0]->nhm_busy_pct_on[112] = 100;
+  g.cards[0]->nhm_busy_pct_on[144] = 100;   // blocked: the prelude's 64 earns the move
+  one_card_found_on_144(g);
+  CHECK(!g.sink.has_line("where the link formed: staying"));
+  CHECK(g.sink.has_line("maburgs channel: relocate 144 -> 64 placed"));
 }
 
 TEST(inflight_dwell_feeds_ranker_and_dwell_stats) {
@@ -2504,18 +2580,22 @@ TEST(set_pin_while_unlinked_moves_op_and_waits_there) {
   CHECK(g.sink.has_move(MoveReason::Commit));
   CHECK(!g.stored.empty() && g.stored.back() == 112);
   CHECK(g.vrx->proposal() == 112);
-  // the scout keeps searching the set but never measures or picks
+  // the scout keeps searching (the set, then the grid too) but never
+  // measures or picks
   const size_t dwells0 = g.sink.dwells.size();
   for (int i = 0; i < 3000; ++i) g.tick();
   CHECK(g.core->op() == 112);
   CHECK(g.sink.picks.empty());
   CHECK(!g.sink.has_line("pick frozen on"));
   REQUIRE(g.sink.dwells.size() > dwells0 + 4);  // a full search round at least
+  bool grid = false;
   for (size_t i = dwells0 + 1; i < g.sink.dwells.size(); ++i) {   // past one dwell already under way
     const uint8_t c = g.sink.dwells[i].second.survey.def.primary;
-    CHECK(c == 40 || c == 64 || c == 112 || c == 144);   // members only, as a pinned boot searches
+    CHECK(mabur::channel_5g(c));
+    grid = grid || !(c == 40 || c == 64 || c == 112 || c == 144);
     CHECK(g.sink.dwells[i].second.survey.observe_ms == 0);   // no observe
   }
+  CHECK(grid);
 }
 
 TEST(set_pin_refused_for_non_member) {
@@ -2631,7 +2711,8 @@ TEST(set_auto_while_unlinked_reopens_the_boot_pick) {
   bool observed_40 = false;
   for (const auto& d : g.sink.dwells) {
     if (d.second.survey.def.primary == 40) observed_40 = true;
-    CHECK(d.second.survey.def.primary != 36);   // never a secondary
+    // never a secondary measured (a grid search burst may land on one)
+    if (d.second.survey.observe_ms > 0) CHECK(d.second.survey.def.primary != 36);
     CHECK(d.second.survey.def.width == CHANNEL_WIDTH_40);
   }
   CHECK(observed_40);
@@ -4125,6 +4206,41 @@ TEST(observe_verb_replies) {
   CHECK(g.core->observe_verb("99999999999999999999") == "ok observe two_card");   // clamps
   g.clk.ms += 5001;
   CHECK(!g.core->observing());
+}
+
+// ---- calibration's width hold ----
+
+// A 20 MHz link calibrating 40: the cards go to 40 for the sweep and come
+// back to the link's width after, and the link's own width never moves.
+TEST(set_cal_width_holds_the_cards_at_40_and_gives_them_back) {
+  Rig g(2, 0, /*pinned=*/true, 40, {40, 64, 112, 144}, /*width=*/20);
+  for (int i = 0; i < 10; ++i) g.tick(true, false, 0);
+  REQUIRE(g.core->width_mhz() == 20);
+  for (auto& c : g.cards) c->calls.clear();
+  g.core->set_cal_width(40);
+  CHECK(g.core->width_mhz() == 20);
+  for (auto& c : g.cards) CHECK(c->width_mhz == 40);
+  CHECK(g.sink.has_line("maburgs link: cards 20 -> 40 MHz (calibration)"));
+  // Held through the ticks: the per-tick resync aims at the hold.
+  for (int i = 0; i < 10; ++i) g.tick(true, false, 0);
+  for (auto& c : g.cards) CHECK(c->width_mhz == 40);
+  g.core->set_cal_width(0);
+  for (auto& c : g.cards) CHECK(c->width_mhz == 20);
+  CHECK(g.sink.has_line("maburgs link: cards 40 -> 20 MHz (calibration)"));
+  for (auto& c : g.cards) c->calls.clear();
+  g.core->set_cal_width(0);  // no change: nothing touched
+  for (auto& c : g.cards) CHECK(!called_set_width(*c));
+}
+
+// A link already at 40: the hold changes nothing on the cards.
+TEST(set_cal_width_on_a_40_mhz_link_touches_no_card) {
+  Rig g(2, 0, /*pinned=*/true, 40);
+  for (int i = 0; i < 10; ++i) g.tick(true, false, 0);
+  for (auto& c : g.cards) c->calls.clear();
+  g.core->set_cal_width(40);
+  for (auto& c : g.cards) CHECK(!called_set_width(*c));
+  g.core->set_cal_width(0);
+  for (auto& c : g.cards) CHECK(!called_set_width(*c));
 }
 
 MTEST_MAIN

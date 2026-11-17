@@ -209,12 +209,38 @@ TEST(residual_demotes_immediately) {
   CHECK(ctl.last_event().reason == CtlReason::Residual);
   CHECK(ctl.counters().demotes_residual == 1);
 
-  // A second residual sample only 50 ms later demotes again -- residual
-  // demotes are exempt from min_between_changes_ms (150 ms default).
+  // The keyframe of that change makes its own residual loss: held 50 ms
+  // later, and the next demote waits for the end of the hold.
   t += 50;
+  CHECK(!ctl.update(bad, t));
+  CHECK(ctl.rung() == 1);
+  t += 1149;
+  CHECK(!ctl.update(bad, t));
+  t += 1;
   CHECK(ctl.update(bad, t));
   CHECK(ctl.rung() == 0);
   CHECK(ctl.counters().demotes_residual == 2);
+}
+
+TEST(residual_hold_does_not_hold_util_demotes) {
+  auto cfg = make_cfg_noprobe();
+  LadderController ctl(cfg);
+  double t = 0;
+  promote_to(ctl, t, 3);
+  feed_for(ctl, t, cfg.probation_ms + 200, 0.3);
+  LinkHealth bad = ok(0.0);
+  bad.residual_loss = 0.01;
+  REQUIRE(ctl.update(bad, t));
+  const double change_t = t;
+  const double high = 0.9 * ctl.budget_base();
+  bool demoted = false;
+  for (int i = 0; i < 20 && !demoted; ++i) {
+    t += 50;
+    demoted = ctl.update(ok(high), t);
+  }
+  CHECK(demoted);
+  CHECK(t - change_t < 1200.0);
+  CHECK(ctl.last_event().reason == CtlReason::Util);
 }
 
 TEST(util_demote_needs_confirm) {
@@ -739,6 +765,7 @@ TEST(event_carries_snr) {
   double t = 0;
   LinkHealth bad = ok3(0.0); bad.residual_loss = 0.05;
   promote_to(ctl, t, 1);
+  feed_for(ctl, t, 1300, 0.3);  // past the hold after the promote
   ctl.update(bad, t);
   CHECK(ctl.last_event().reason == CtlReason::Residual);
   CHECK(ctl.last_event().snr_db == 30.0);
@@ -799,11 +826,9 @@ TEST(measured_rung_equals_rung_when_no_demote) {
   CHECK(ctl.measured_rung() == ctl.rung());
 }
 
-TEST(s3_residual_demote_is_exempt_from_min_between_changes) {
-  // s1's instant residual path is exempt from min_between_changes_ms; s3's
-  // now is too. s3_settle_ms (300) is longer than min_between_changes_ms
-  // (150), so the blank would mask the spacing gate entirely — zero it to
-  // isolate what this test is actually about.
+TEST(s3_residual_demote_waits_for_the_rung_change_hold) {
+  // s3_settle_ms (300) would mask the hold's start, so zero it to isolate
+  // what this test is actually about.
   LadderCfg cfg = make_cfg_noprobe();
   cfg.s3_settle_ms = 0;
   LadderController ctl(cfg);
@@ -813,7 +838,10 @@ TEST(s3_residual_demote_is_exempt_from_min_between_changes) {
   REQUIRE(ctl.probation_ms_left(t) == 0);
   const int before = ctl.rung();
   REQUIRE(ctl.update(ok3(0.3 * ctl.budget_base(), 0.0, 0.02), t));
-  t += 50;  // well inside min_between_changes_ms (150)
+  t += 50;
+  CHECK(!ctl.update(ok3(0.3 * ctl.budget_base(), 0.0, 0.02), t));
+  CHECK(ctl.rung() == before - 1);
+  t += 1150;
   CHECK(ctl.update(ok3(0.3 * ctl.budget_base(), 0.0, 0.02), t));
   CHECK(ctl.rung() == before - 2);
 }
@@ -978,7 +1006,7 @@ TEST(rung_store_residual_demote_sample_feeds_measured_rung) {
   LadderController ctl(make_cfg_noprobe());
   double t = 0;
   promote_to(ctl, t, 2);
-  feed_for(ctl, t, 400, 0.5);    // clears the post-promote blank
+  feed_for(ctl, t, 1300, 0.5);    // clears the post-promote blank and hold
   const uint64_t n_before = ctl.rungs().stat(2).u.n;
   LinkHealth bad = ok(0.0);
   bad.residual_loss = 0.01;
@@ -1117,15 +1145,15 @@ TEST(fade_regime_s3_blanking_invariant_holds) {
     if (ctl.update(ok(bad), t)) demote_t = t;
   REQUIRE(demote_t > 0);
   // Immediately feed continuous s3 residual pressure (clean s1). The s3
-  // demote may not fire before s3_settle_ms (300, blanks s3_live) has
-  // elapsed, but fires instantly on the first live sample after that.
+  // demote may not fire before the rung-change hold (1200) has elapsed,
+  // which outlasts s3_settle_ms (300), but fires on the first sample after.
   double s3_demote_t = -1;
   for (int i = 0; i < 40 && s3_demote_t < 0; ++i, t += 50)
     if (ctl.update(ok3(0.0, 0.0, /*s3_resid=*/0.02), t)) s3_demote_t = t;
   REQUIRE(s3_demote_t > 0);
   CHECK(ctl.last_event().reason == CtlReason::S3Residual);
-  CHECK(s3_demote_t - demote_t >= cfg.s3_settle_ms);        // blank fully honored
-  CHECK(s3_demote_t - demote_t < cfg.s3_settle_ms + 50.0);  // fires on the very next sample
+  CHECK(s3_demote_t - demote_t >= 1200.0);  // hold fully honored
+  CHECK(s3_demote_t - demote_t < 1250.0);   // fires on the very next sample
 }
 
 TEST(fade_cascade_kill_switch_is_legacy) {
@@ -1470,4 +1498,209 @@ TEST(blank_store_does_not_suspend_s3_decisions_only_the_ewma) {
   CHECK(ctl.counters().demotes_s3_residual == 1);
   CHECK(ctl.last_event().reason == CtlReason::S3Residual);
   CHECK(ctl.rungs().stat(before_rung).s3_resid.n == before_n);
+}
+
+namespace {
+
+// Probe off, no probation penalty, no hold after a demote, a 1 s clean run
+// and a 30 s lockout latching at the 4th strike: every promote that is held
+// back below is held by the lockout and nothing else.
+LadderCfg lockout_cfg() {
+  LadderCfg cfg = make_cfg_noprobe();
+  cfg.penalty_base_ms = 0;
+  cfg.penalty_max_ms = 0;
+  cfg.hold_after_down_ms = 0;
+  cfg.clean_ms = 1000;
+  cfg.lockout_ms = 30000;
+  cfg.lockout_latch = 4;
+  return cfg;
+}
+
+LinkHealth resid() {
+  LinkHealth h = ok(0.0);
+  h.residual_loss = 0.05;
+  return h;
+}
+
+int lock_ms_for(const LadderController& ctl, double now_ms, int rung) {
+  for (const auto& l : ctl.locked(now_ms)) {
+    if (l.rung == rung) return l.ms_left;
+  }
+  return 0;  // not locked
+}
+
+// Clean samples until the ladder climbs to `rung`; returns the promote time.
+double climb_back(LadderController& ctl, double& t, int rung) {
+  while (ctl.rung() < rung) {
+    ctl.update(ok(0.0), t);
+    if (ctl.rung() == rung) return t;
+    t += 50;
+    REQUIRE(t < 1e7);
+  }
+  return t;
+}
+
+}  // namespace
+
+TEST(lockout_strikes_lock_for_lockout_ms_and_the_fourth_latches) {
+  const LadderCfg cfg = lockout_cfg();
+  LadderController ctl(cfg);
+  double t = 0;
+  promote_to(ctl, t, 2);
+  for (int strike = 1; strike <= 4; ++strike) {
+    feed_for(ctl, t, 4000, 0.3);  // out of probation and the residual hold
+    REQUIRE(ctl.rung() == 2);
+    t += 50;
+    const double down_t = t;
+    CHECK(ctl.update(resid(), t));
+    CHECK(ctl.rung() == 1);
+    CHECK(ctl.last_event().reason == CtlReason::Residual);
+    CHECK(ctl.strikes(2) == strike);
+    CHECK(ctl.strikes(1) == 0);
+    if (strike < 4) {
+      CHECK(lock_ms_for(ctl, t, 2) == cfg.lockout_ms);
+      // Clean all through the lock, then up within one clean run after it.
+      const double up_t = climb_back(ctl, t, 2);
+      CHECK(up_t >= down_t + cfg.lockout_ms);
+      CHECK(up_t <= down_t + cfg.lockout_ms + cfg.clean_ms + 100);
+      CHECK(ctl.strikes(2) == strike);  // an expired lock keeps its strikes
+    } else {
+      CHECK(lock_ms_for(ctl, t, 2) == -1);
+      t += 50;
+      feed_for(ctl, t, 300000, 0.0);
+      CHECK(ctl.rung() == 1);  // latched: five clean minutes do not lift it
+      CHECK(lock_ms_for(ctl, t, 2) == -1);
+    }
+  }
+  (void)t;
+}
+
+TEST(lockout_locked_rung_is_a_ceiling_and_the_floor_is_never_locked) {
+  const LadderCfg cfg = lockout_cfg();
+  LadderController ctl(cfg);
+  double t = 0;
+  promote_to(ctl, t, 2);
+  feed_for(ctl, t, 4000, 0.3);
+  t += 50;
+  ctl.update(resid(), t);  // strike rung 2
+  REQUIRE(ctl.rung() == 1);
+  const double r2_free = t + cfg.lockout_ms;
+  feed_for(ctl, t, 1300, 0.3);  // past the residual hold, no promote
+  t += 50;
+  ctl.update(resid(), t);  // strike rung 1, down to the floor
+  REQUIRE(ctl.rung() == 0);
+  CHECK(ctl.strikes(1) == 1);
+  CHECK(ctl.strikes(0) == 0);
+  CHECK(lock_ms_for(ctl, t, 0) == 0);
+  // Rung 1 back by a hop that kept the strikes off (an unpin re-entry keeps
+  // them): the climb from 1 stops under the still-locked rung 2.
+  ctl.unpin_restore(1, t);
+  t += 50;
+  const double up_t = climb_back(ctl, t, 2);
+  CHECK(up_t >= r2_free);
+  CHECK(up_t <= r2_free + cfg.clean_ms + 100);
+}
+
+TEST(lockout_counts_util_s3_and_probation_demotes) {
+  LadderCfg cfg = lockout_cfg();
+  LadderController ctl(cfg);
+  double t = 0;
+  promote_to(ctl, t, 3);
+  feed_for(ctl, t, 4000, 0.3);
+  // s1 util: over down_util for the confirm window.
+  while (ctl.rung() == 3) {
+    ctl.update(ok(0.9 * ctl.budget_base()), t);
+    t += 50;
+    REQUIRE(t < 1e6);
+  }
+  CHECK(ctl.last_event().reason == CtlReason::Util);
+  CHECK(ctl.strikes(3) == 1);
+  // s3 residual on rung 2.
+  feed_for(ctl, t, 1300, 0.3);
+  ctl.update(ok3(0.3 * ctl.budget_base(), 0.0, 0.05), t);
+  CHECK(ctl.last_event().reason == CtlReason::S3Residual);
+  CHECK(ctl.strikes(2) == 1);
+  // Probation: util over down_util right after the promote back to 2.
+  LadderCfg c2 = lockout_cfg();
+  c2.lockout_ms = 1000;
+  LadderController p(c2);
+  double tp = 0;
+  promote_to(p, tp, 1);
+  REQUIRE(p.probation_ms_left(tp) > 0);
+  tp += 50;
+  p.update(ok(0.9 * p.budget_base()), tp);
+  CHECK(p.last_event().reason == CtlReason::Probation);
+  CHECK(p.strikes(1) == 1);
+  CHECK(lock_ms_for(p, tp, 1) == 1000);
+}
+
+TEST(lockout_ignores_timeout_starved_and_is_off_by_default) {
+  {
+    LadderController ctl(lockout_cfg());
+    double t = 0;
+    promote_to(ctl, t, 2);
+    t += 2000;  // no feedback past feedback_timeout_ms
+    CHECK(ctl.on_tick(t));
+    CHECK(ctl.last_event().reason == CtlReason::Timeout);
+    CHECK(ctl.locked(t).empty());
+    CHECK(ctl.strikes(2) == 0);
+  }
+  {
+    LadderController ctl(lockout_cfg());
+    double t = 0;
+    promote_to(ctl, t, 2);
+    LinkHealth s = ok(0.0);
+    s.video_starved = true;
+    while (ctl.rung() > 0) {
+      ctl.update(s, t);
+      t += 50;
+      REQUIRE(t < 1e5);
+    }
+    CHECK(ctl.last_event().reason == CtlReason::Starved);
+    CHECK(ctl.locked(t).empty());
+  }
+  {
+    LadderCfg cfg = lockout_cfg();
+    cfg.lockout_ms = 0;
+    LadderController ctl(cfg);
+    double t = 0;
+    promote_to(ctl, t, 2);
+    feed_for(ctl, t, 4000, 0.3);
+    t += 50;
+    ctl.update(resid(), t);
+    REQUIRE(ctl.rung() == 1);
+    CHECK(ctl.strikes(2) == 0);
+    CHECK(ctl.locked(t).empty());
+    climb_back(ctl, t, 2);  // straight back up, as before the lockout
+  }
+}
+
+TEST(lockout_hop_restore_and_clear_forget_every_strike) {
+  LadderController ctl(lockout_cfg());
+  double t = 0;
+  promote_to(ctl, t, 2);
+  for (int i = 0; i < 4; ++i) {
+    feed_for(ctl, t, 4000, 0.3);
+    t += 50;
+    ctl.update(resid(), t);
+    if (i < 3) climb_back(ctl, t, 2);
+  }
+  REQUIRE(lock_ms_for(ctl, t, 2) == -1);
+  ctl.restore(1, t);
+  CHECK(ctl.locked(t).empty());
+  CHECK(ctl.strikes(2) == 0);
+  // A swap-in controller and an unpin keep nothing of the old ladder or
+  // the pin; clear_lockout() is what a new drone session calls.
+  feed_for(ctl, t, 4000, 0.3);
+  t += 50;
+  climb_back(ctl, t, 2);
+  feed_for(ctl, t, 4000, 0.3);
+  t += 50;
+  ctl.update(resid(), t);
+  REQUIRE(ctl.strikes(2) == 1);
+  ctl.unpin_restore(1, t);
+  CHECK(ctl.strikes(2) == 1);  // an unpin is the same link
+  ctl.clear_lockout();
+  CHECK(ctl.locked(t).empty());
+  CHECK(ctl.strikes(2) == 0);
 }

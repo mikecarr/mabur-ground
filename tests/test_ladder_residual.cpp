@@ -116,9 +116,10 @@ TEST(dropped_unit_is_residual_loss) {
 
 // The same scaffold as dropped_unit_is_residual_loss, but the withheld body
 // arrives later as a retransmit: the video is whole (the retx fills the
-// content), yet the ladder must still see the loss -- a NACK retransmit fixes
-// the video only.
-TEST(retx_filled_symbol_is_still_residual_loss) {
+// content). The stats still book the missing direct copy as loss; the
+// ladder's demote input does not, or every retransmit that beats the FEC
+// repairs would cost a rung.
+TEST(retx_filled_symbol_is_loss_in_the_stats_and_not_for_the_ladder) {
   auto layers = one_symbol_layers();
   UepEncoder enc(layers, /*flush_ms=*/15);
   UepDecoder dec(layers);
@@ -148,6 +149,60 @@ TEST(retx_filled_symbol_is_still_residual_loss) {
   const auto rc = maburgs::residual_counts(dec, 0, /*cur=*/false);
   CHECK(rc.expected > rc.arrived);      // the retx-filled seq counts as not arrived
   CHECK(dec.stats(0).syms_retx >= 1);
+  const auto lr = maburgs::ladder_residual_counts(dec);
+  CHECK(lr.expected > 0);
+  CHECK(lr.expected == lr.arrived);     // ...and as arrived for the ladder
+}
+
+// The same retx-filled seq under each link.nack_residual mode: "filled"
+// counts it arrived, "all" lost, "timely" lost only when the NACK tracker
+// saw the fill past its deadline (late_fills). The denominator is the same
+// in all three, so a mode only moves the one symbol between the columns.
+TEST(nack_residual_modes_book_the_retx_filled_symbol) {
+  auto layers = one_symbol_layers();
+  UepEncoder enc(layers, /*flush_ms=*/15);
+  UepDecoder dec(layers);
+  std::mt19937 rng(7);
+  uint64_t now = 1000;
+  for (uint32_t i = 0; i < 60; ++i) {
+    auto unit = make_unit(i, 64, rng);
+    auto bodies = enc.add_frame(0, unit.data(), unit.size(), now);
+    REQUIRE(!bodies.empty());
+    now += 5;
+    auto body = bodies[0].body;
+    if (i == 1) body[3] |= mabur::kSbiRetxMark;  // only a retransmit arrives
+    dec.add_body(body.data(), body.size(), now);
+  }
+  REQUIRE(dec.stats(0).syms_retx == 1);
+  using maburgs::NackResidual;
+  const auto filled = maburgs::ladder_residual_counts(dec, NackResidual::kFilled, 1);
+  const auto all = maburgs::ladder_residual_counts(dec, NackResidual::kAll, 0);
+  const auto timely_ok = maburgs::ladder_residual_counts(dec, NackResidual::kTimely, 0);
+  const auto timely_late = maburgs::ladder_residual_counts(dec, NackResidual::kTimely, 1);
+  CHECK(filled.expected > 0);
+  CHECK(filled.arrived == filled.expected);           // late_fills ignored
+  CHECK(all.expected == filled.expected && all.arrived == all.expected - 1);
+  CHECK(timely_ok.expected == filled.expected && timely_ok.arrived == timely_ok.expected);
+  CHECK(timely_late.expected == filled.expected &&
+        timely_late.arrived == timely_late.expected - 1);
+  // "all" is the rule before retransmits counted as arrived: the stats'
+  // own current-rung residual.
+  const auto stats_cur = maburgs::residual_counts(dec, 0, /*cur=*/true);
+  CHECK(all.arrived == stats_cur.arrived && all.expected == stats_cur.expected);
+  // A late count above syms_retx cannot push arrived below the direct ones.
+  const auto over = maburgs::ladder_residual_counts(dec, NackResidual::kTimely, 5);
+  CHECK(over.arrived == all.arrived);
+}
+
+TEST(nack_residual_names_round_trip) {
+  using maburgs::NackResidual;
+  for (auto m : {NackResidual::kFilled, NackResidual::kAll, NackResidual::kTimely}) {
+    const auto p = maburgs::parse_nack_residual(maburgs::nack_residual_name(m));
+    CHECK(p.has_value() && *p == m);
+  }
+  CHECK(!maburgs::parse_nack_residual("late").has_value());
+  CHECK(!maburgs::parse_nack_residual("Filled").has_value());
+  CHECK(!maburgs::parse_nack_residual("").has_value());
 }
 
 // The pooled observability view is exactly the two layers summed -- the

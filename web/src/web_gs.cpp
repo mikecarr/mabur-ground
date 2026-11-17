@@ -66,7 +66,8 @@ namespace {
 maburgs::LinkHealthCfg lh_cfg(const maburgs::Config& cfg) {
   const auto enh = cfg.uep_layers()[1];
   return {1, enh.blocks_per_body,
-          static_cast<int>(mabur::sw::kSwHeaderLen) + enh.fec.symbol_size};
+          static_cast<int>(mabur::sw::kSwHeaderLen) + enh.fec.symbol_size, {},
+          cfg.link.nack_residual};
 }
 }  // namespace
 
@@ -113,6 +114,8 @@ WebGs::WebGs(const maburgs::Config& cfg, Mode mode, uint8_t start_ch, int width,
              if (cur_.salvaged) ++aus_salvaged_;
              cur_.t_first_us = lat.t_first_us;
              cur_.t_complete_us = now_us_;
+             cur_.skipped_before = lat.skipped_before;
+             cur_.vcl_nal = lat.vcl_nal;
              if (slot_)
                slot_->on_au_complete(now_us_ / 1000,
                                      cur_.sid < 2 &&
@@ -122,6 +125,7 @@ WebGs::WebGs(const maburgs::Config& cfg, Mode mode, uint8_t start_ch, int width,
                    cap_to_complete_us(cur_.pts_us, cur_.t_complete_us, rtt_.pts_off_us());
              ++(complete ? aus_complete_ : aus_truncated_);
              if (!complete && cur_.sid == 0) ++aus_truncated_base_;
+             if (complete && cur_.sid == 0 && lat.retx_fill) ++aus_nack_saved_;
              if (io_.on_au) io_.on_au(std::move(cur_));
              cur_ = Au{};
            }}),
@@ -146,6 +150,9 @@ WebGs::WebGs(const maburgs::Config& cfg, Mode mode, uint8_t start_ch, int width,
     // from here on.
     maburgs::VrxCfg vc = maburgs::vrx_cfg_from(cfg, start_ch);
     vc.rz_nonce = opts_.rz_nonce;
+    // The DISC proposes the width the cards are tuned to: the page's width,
+    // which for a Spotter is its own pick and not the ladder's.
+    vc.width = static_cast<uint8_t>(width == 40 ? 40 : 20);
     vrx_ = std::make_unique<maburgs::VrxController>(vc);
     slot_ = std::make_unique<maburgs::RcfSlotter>(
         maburgs::RcfSlotCfg{cfg.link.rcf_slot_hold_ms, 100, 2, 3, 1});
@@ -351,8 +358,9 @@ void WebGs::reset_video_() {
 
 // maburgs main.cpp's NACK block: base-layer
 // selective repeat. Direct send, mid-burst -- never the RcfSlotter (bench:
-// slotted fill p50 44 ms, past the gap timeout). Option A: the retransmit
-// fixes the video only; every ladder input still books the loss. No
+// slotted fill p50 44 ms, past the gap timeout). The pre-FEC util still
+// books the loss; the ladder's residual books a fill as link.nack_residual
+// says, and reads filled_late from this poll, so it runs before lha_.tick. No
 // calibration radio-silence gate here: the page has no calibration.
 void WebGs::poll_nack_(uint64_t now_ms) {
   const auto sctx = vrx_->session_ctx();
@@ -504,6 +512,7 @@ void WebGs::tick(uint64_t now_us) {
   } else {
     in.op = spotter_op_;
   }
+  if (nack_) in.nack_late_fills = nack_->stats().filled_late;
   const auto lh = lha_.tick(now_ms, agg_, in);
   last_health_ = lh.health;
   const std::vector<uint8_t>* sent = nullptr;
@@ -624,6 +633,7 @@ Stats WebGs::stats() const {
   s.aus_complete = aus_complete_;
   s.aus_truncated = aus_truncated_;
   s.aus_truncated_base = aus_truncated_base_;
+  s.aus_nack_saved = aus_nack_saved_;
   s.aus_salvaged = aus_salvaged_;
   s.sends = sends_;
   s.rcf_sent = rcf_sent_;
@@ -731,6 +741,7 @@ std::string stats_json(const Stats& s) {
   j["aus"] = s.aus_complete;
   j["trunc"] = s.aus_truncated;
   j["trunc_base"] = s.aus_truncated_base;
+  j["nack_saved"] = s.aus_nack_saved;
   j["salvaged"] = s.aus_salvaged;
   j["sends"] = s.sends;
   j["rcf_sent"] = s.rcf_sent;

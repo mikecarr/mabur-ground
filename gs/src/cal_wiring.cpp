@@ -34,10 +34,12 @@ const char* cal_state_name(CalSession::State st) {
 
 const char* cal_kind_name(const CalSnapshot& snap) {
   if (snap.state == CalSession::State::Verify) return "verify";
+  if (snap.cur.kind == cal::Kind::Floor) return "floor";
   return snap.cur.kind == cal::Kind::Capacity ? "capacity" : "power";
 }
 
 std::string cal_sweep_token(const cal::SweepSpec& spec) {
+  if (spec.kind == cal::Kind::Floor) return "floor";  // always 40 MHz
   const char* k = spec.kind == cal::Kind::Capacity ? "cap" : "power";
   return std::string(k) + std::to_string(spec.bw);
 }
@@ -126,8 +128,11 @@ std::vector<std::string> CalNarrator::observe(const CalSnapshot& snap,
       out.push_back("calibration sweep " + k_of_n(i, sweeps.size()) + " " +
                     cal_sweep_token(sweeps[i]) + " done");
   }
-  if (snap.state == CalSession::State::Done)
+  if (snap.state == CalSession::State::Done) {
+    if (!snap.width[1].skipped.empty())
+      out.push_back("calibration 40 MHz uncalibrated: " + snap.width[1].skipped);
     out.push_back("calibration done");
+  }
   else if (snap.state == CalSession::State::Failed)
     out.push_back("calibration failed: " + snap.fail_reason);
   else if (snap.state == CalSession::State::Idle)

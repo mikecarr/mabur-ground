@@ -94,6 +94,9 @@ ChannelCore::ChannelCore(ChannelCoreCfg cfg, std::vector<LinkCard*> cards, VrxCo
     sc.busy_dbm = cfg_.radio.scan.busy.busy_dbm;
     sc.blocked_pct = cfg_.radio.scan.busy.blocked_pct;
     sc.leak_per_frame = cfg_.leak_per_frame;
+    // Two passes over the set find a drone on it; past that the search
+    // also bursts on the rest of the 5 GHz grid.
+    sc.grid_after_rounds = 2;
     scout_ = std::make_unique<ChannelScout>(
         sc, *cards_[static_cast<size_t>(scout_card_)],
         [this] { return static_cast<int64_t>(now_ms_()); },
@@ -334,15 +337,46 @@ void ChannelCore::on_session_opened(const mabur::rc::DiscAck& ack, double now_ms
   // that OPENED the session -- our nonce, not key-mismatch flagged, so a
   // stranger's drone cannot drag the cards -- and only on the rx_channel of
   // this body. plan.link_found() moves op to it for every card; the
-  // relocation to plan.want(), if any, is an ordinary hop order (BootPick).
+  // relocation to plan.want(), if the ranking still earns it there
+  // (keep_found_link_), is an ordinary hop order (BootPick).
   const uint8_t x = rc_body_rx_ch_;
   if (ack.vrx_nonce == vrx_.rz_nonce() && !(ack.flags & mabur::rc::kAckKeyMismatch) &&
-      x != 0 && x != plan_.op() && plan_.member(x) && !plan_.hopping()) {
-    sink_.log(logf_("maburgs channel: drone found on %u (op %u): the link forms there",
-                    static_cast<unsigned>(x), static_cast<unsigned>(plan_.op())));
+      x != 0 && x != plan_.op() && (plan_.member(x) || mabur::channel_5g(x)) &&
+      !plan_.hopping()) {
+    sink_.log(logf_("maburgs channel: drone found on %u (op %u): the link forms there%s",
+                    static_cast<unsigned>(x), static_cast<unsigned>(plan_.op()),
+                    plan_.member(x) ? "" : " (outside the set)"));
     plan_.link_found(now_ms, x);
+    keep_found_link_(now_ms, x);
     vrx_.set_proposal(plan_.op());   // a DISC proposes the channel it is sent on: stay
   }
+}
+
+void ChannelCore::keep_found_link_(double now_ms, uint8_t x) {
+  const uint8_t want = plan_.want();
+  // link_found() refuses while a hop is in flight: op stayed, so want does.
+  if (plan_.op() != x) return;
+  // A pin and a calibration's pick are orders, not a ranking: relocated as
+  // ever. A drone found outside the set comes back into it.
+  if (want == x || pinned_ || !plan_.member(x) || cal_reloc_.s == CalReloc::Waiting ||
+      cal_reloc_.s == CalReloc::InFlight)
+    return;
+  if (scout_ && relocation_earned(scout_->ranking(), x, want, pick_min_rounds_(),
+                                  cfg_.radio.scan.pick_margin_pct,
+                                  cfg_.radio.scan.busy.blocked_pct))
+    return;
+  sink_.log(logf_("maburgs channel: %u does not out-rank %u where the link formed: staying",
+                  static_cast<unsigned>(want), static_cast<unsigned>(x)));
+  plan_.set_want(now_ms, x);
+}
+
+int ChannelCore::pick_min_rounds_() const {
+  // One card: a prelude cut short ranks on one round (scout_->mature()'s
+  // own effective min_rounds).
+  return (one_card_ && scout_ && scout_->prelude_done() &&
+          scout_->rounds() < static_cast<uint64_t>(cfg_.radio.scan.min_rounds))
+             ? 1
+             : cfg_.radio.scan.min_rounds;
 }
 
 std::vector<int> ChannelCore::disc_targets(int tx) const {
@@ -363,7 +397,7 @@ bool ChannelCore::may_send(int card) const {
 std::vector<uint8_t> ChannelCore::disc_for_card(const std::vector<uint8_t>& frame, int card) const {
   // A DISC proposes the channel it is sent on.
   const uint8_t ch = cards_[static_cast<size_t>(card)]->channel();
-  if (plan_.member(ch)) return disc_for_channel(frame, ch, cfg_.key);
+  if (plan_.member(ch) || mabur::channel_5g(ch)) return disc_for_channel(frame, ch, cfg_.key);
   return frame;
 }
 
@@ -374,10 +408,7 @@ void ChannelCore::note_sent(bool sent_ok, bool is_rcf) {
 void ChannelCore::freeze_pick_(double t, const char* why) {
   if (!scout_) return;
   scout_->freeze();
-  const int mr = (one_card_ && scout_->prelude_done() &&
-                  scout_->rounds() < static_cast<uint64_t>(cfg_.radio.scan.min_rounds))
-                     ? 1
-                     : cfg_.radio.scan.min_rounds;
+  const int mr = pick_min_rounds_();
   const auto all = scout_->ranking();
   bool any = false;
   // The ranking's width is the scout's: its dwells ran at its card's width.
@@ -936,7 +967,7 @@ void ChannelCore::step_move_edge_(const ChannelTickIn& in) {
   if (cal_move_hold_.take(vrx_.take_move_edge(), in.cal_running || plan_.hopping())) {
     const uint8_t proposed = vrx_.proposal();
     const uint8_t agreed = vrx_.agreed_channel();
-    if (!plan_.member(agreed))
+    if (!plan_.member(agreed) && agreed != plan_.op())
       sink_.log(logf_("maburgs channel: drone acked %u, not in our set; ignored",
                       static_cast<unsigned>(agreed)));
     plan_.on_ack(now_ms, agreed, proposed);
@@ -1005,16 +1036,17 @@ void ChannelCore::step_width_resync_() {
     const bool scouting = scout_busy && i == scout_card_;
     const WidthCard wc{fe.ready(), fe.width(), width_tried_[static_cast<size_t>(i)],
                        dwell_busy_.load() && dwell_card_.load() == i, scouting};
-    if (needs_width_fix(wc, width_mhz_)) {
+    const uint8_t want = resync_width_();
+    if (needs_width_fix(wc, want)) {
       width_tried_[static_cast<size_t>(i)] = true;
       std::lock_guard<std::mutex> ilk(inflight_mu_);
       const uint8_t ch = fe.channel();
-      if (fe.set_width(ch, width_mhz_)) {
+      if (fe.set_width(ch, want)) {
         cur_ch_[static_cast<size_t>(i)] = fe.channel();
         tune_gen_[static_cast<size_t>(i)].fetch_add(1, std::memory_order_release);
       } else {
         sink_.log(logf_("maburgs radio: card %d width resync to %u MHz on ch %u failed", i,
-                        static_cast<unsigned>(width_mhz_), static_cast<unsigned>(ch)));
+                        static_cast<unsigned>(want), static_cast<unsigned>(ch)));
       }
     }
     // The scout's dwells, ranks and picks are as wide as its card. Told
@@ -1212,6 +1244,17 @@ void ChannelCore::set_width(uint8_t want) {
     std::lock_guard<std::mutex> ilk(inflight_mu_);
     inflight_->set_width_mhz(want);
   }
+}
+
+void ChannelCore::set_cal_width(uint8_t w) {
+  if (w == cal_width_) return;
+  const uint8_t was = resync_width_();
+  cal_width_ = w;
+  if (resync_width_() == was) return;
+  sink_.log(logf_("maburgs link: cards %u -> %u MHz (calibration)", static_cast<unsigned>(was),
+                  static_cast<unsigned>(resync_width_())));
+  width_tried_.assign(width_tried_.size(), false);
+  step_width_resync_();
 }
 
 std::optional<std::string> ChannelCore::set_pin(uint8_t ch) {

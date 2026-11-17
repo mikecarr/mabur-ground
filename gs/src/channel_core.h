@@ -332,6 +332,12 @@ class ChannelCore {
   // in-flight scout records its dwells at it, and the boot scout follows
   // once its card is retuned. The caller has checked width_refusal first.
   void set_width(uint8_t want);
+  // Calibration's hold on the cards' width: 40 while a 40 MHz sweep runs
+  // (CalSession::cal_width), 0 to give them back to width_mhz(). Only the
+  // per-card resync target moves -- the ranker, the scout and the ladder
+  // keep the link's width -- and a change re-arms every card's resync.
+  void set_cal_width(uint8_t w);
+  uint8_t cal_width() const { return cal_width_; }
   // ---- live ladder swap (core thread) ----
   // VrxController::replace_ladder, plus the hop verdict's frozen restore
   // rung translated by {mcs, bw} into the new ladder (rung 0 when it has no
@@ -412,6 +418,9 @@ class ChannelCore {
   // ---- per-card bookkeeping (core thread) ----
   std::vector<uint8_t> cur_ch_;
   uint8_t width_mhz_ = 20;     // the live receiver width (set_width); cfg_.width_mhz at start
+  uint8_t cal_width_ = 0;      // set_cal_width; 0 = none
+  // What the per-card width resync holds the cards at.
+  uint8_t resync_width_() const { return cal_width_ ? cal_width_ : width_mhz_; }
   std::vector<bool> width_tried_;
   std::vector<std::optional<StatsEnergyIn>> energy_last_;
   std::vector<std::optional<StatsDwellIn>> dwell_stats_;
@@ -632,6 +641,12 @@ class ChannelCore {
   // its busy reading in member_figs_ against the member it was dwelt on.
   void emit_dwell_(double now_ms, int card, const ScoutDwell& d);
   void freeze_pick_(double t, const char* why);
+  // The link formed on x != want: want follows x unless the scout's ranking
+  // earns the move (relocation_earned); pins, a calibration's relocation and
+  // a drone found outside the set keep their relocation.
+  void keep_found_link_(double now_ms, uint8_t x);
+  // The min_rounds the boot pick ranks with.
+  int pick_min_rounds_() const;
   void dispatch_hop_action_(const HopAction& act, bool relocate_tick, double now_ms);
   void apply_hop_action_(const HopAction& act, double now_ms);
   void step_scout_inputs_();
